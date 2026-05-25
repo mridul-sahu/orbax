@@ -30,6 +30,7 @@ from absl import logging
 from clu import metric_writers
 from etils import epath
 import numpy as np
+from orbax.checkpoint._src.testing.benchmarks.core import markdown_cards
 from orbax.checkpoint._src.testing.benchmarks.core import multihost
 from orbax.checkpoint._src.testing.benchmarks.core import run_manifest as run_manifest_lib
 import psutil
@@ -454,33 +455,7 @@ class _MetricsCollector:
 ################################################################################
 
 
-def _options_to_hparams(options: Any) -> dict[str, bool | int | float | str]:
-  """Flattens a benchmark options object into a TB HParams-acceptable dict.
-
-  HParams values must be primitives (bool / int / float / str). Anything else
-  (None, list, tuple, nested) is rendered via str() so the run still appears
-  in the Parallel Coordinates view rather than getting dropped.
-
-  Args:
-    options: A dataclass instance or dict of benchmark options to flatten;
-      anything else yields an empty dict.
-
-  Returns:
-    A dict of primitive HParam values keyed by option name.
-  """
-  if dataclasses.is_dataclass(options):
-    raw = dataclasses.asdict(options)
-  elif isinstance(options, dict):
-    raw = dict(options)
-  else:
-    return {}
-  out: dict[str, bool | int | float | str] = {}
-  for k, v in raw.items():
-    if isinstance(v, (bool, int, float, str)):
-      out[k] = v
-    else:
-      out[k] = str(v)
-  return out
+# Render helpers + HParams sanitizer live in markdown_cards.py.
 
 
 def _summary_aggregates(
@@ -518,194 +493,7 @@ def _summary_aggregates(
   return out
 
 
-_SCORECARD_HEADLINE_KEYS: tuple[tuple[str, str, str], ...] = (
-    # Keys carry the measure() operation prefix (save_blocking_, save_background_,
-    # load_) that `_add_results` splices in front of the namespaced metric key.
-    # (aggregate key, label, stat to use as the headline)
-    ("save_blocking_4_throughput/save_blocking_gbps",
-     "Save blocking throughput (max GiB/s)", "max"),
-    ("save_background_4_throughput/save_total_gbps",
-     "Save total throughput (max GiB/s)", "max"),
-    ("load_4_throughput/load_total_gbps",
-     "Load throughput (max GiB/s)", "max"),
-    ("load_4_throughput/load_per_host_gbps",
-     "Load per-host throughput (max GiB/s)", "max"),
-    ("save_background_5_inventory/save_total_gb",
-     "Save total per host (GiB)", "max"),
-    ("load_5_inventory/load_total_gb",
-     "Load total per host (GiB)", "max"),
-    ("save_blocking_2_save_breakdown/blocking_async_s",
-     "Save blocking (slowest host, s)", "max"),
-    ("load_3_load_breakdown/blocking_s",
-     "Load blocking (slowest host, s)", "max"),
-    ("save_blocking_7_overhead/sync_global_devices_s",
-     "Sync-barrier overhead (slowest host, s)", "max"),
-)
-
-
-def _render_scorecard_markdown(
-    benchmark_name: str,
-    aggregates: dict[str, dict[str, float]],
-    inventory: "Any | None",
-    manifest: "Any | None",
-) -> str:
-  """Renders the per-benchmark scorecard.
-
-  Headline metrics come from the cross-host aggregate dict
-  (`{metric_key → {stat_name → value}}`) keyed off the curated list above.
-  Inventory + manifest sections are included only when provided so the card
-  stays compact for benchmarks that opted out of those captures.
-  """
-  lines = [f"## {benchmark_name} — scorecard", ""]
-
-  headline_rows = []
-  for agg_key, label, stat in _SCORECARD_HEADLINE_KEYS:
-    if agg_key in aggregates and stat in aggregates[agg_key]:
-      headline_rows.append((label, aggregates[agg_key][stat]))
-
-  if headline_rows:
-    lines.extend(["### Headline numbers", ""])
-    lines.append("| metric | value |")
-    lines.append("|---|---:|")
-    for label, value in headline_rows:
-      lines.append(f"| {label} | {value:.4f} |")
-    lines.append("")
-
-  if inventory is not None:
-    lines.extend(["### Inventory", ""])
-    lines.append("| field | value |")
-    lines.append("|---|---:|")
-    total_gb = inventory.total_bytes / (1024 ** 3)
-    lines.append(f"| total bytes | {total_gb:.2f} GiB |")
-    lines.append(f"| file count | {inventory.file_count:,} |")
-    small_pct = inventory.small_file_pct * 100
-    canary = "✓" if small_pct < 10 else "⚠ chunk_byte_size too small?"
-    lines.append(f"| small files <1 MiB | {small_pct:.1f}% {canary} |")
-    if inventory.largest_file_bytes > 0:
-      lines.append(
-          f"| largest file | {inventory.largest_file_bytes / (1024**2):.2f} MiB |"
-      )
-    if inventory.format:
-      fmt_str = ", ".join(f"{k}={v}" for k, v in sorted(inventory.format.items()))
-      lines.append(f"| format breakdown | {fmt_str} |")
-    lines.append("")
-
-  if manifest is not None:
-    lines.append(manifest.as_markdown())
-
-  return "\n".join(lines)
-
-
-def _render_configuration_markdown(
-    benchmark_name: str,
-    benchmark_options: dict[str, Any] | None,
-    checkpoint_config: dict[str, Any] | None,
-) -> str:
-  """Renders the run configuration as readable markdown.
-
-  Options + checkpoint_config become two field/value tables; any nested
-  dict in checkpoint_config (typically `spec`) is split out into its own
-  fenced-JSON block. Replaces the single-line `json.dumps` blob the
-  Text-tab card used to show.
-
-  Args:
-    benchmark_name: Title rendered as the top-level `##` heading.
-    benchmark_options: Flat option name/value pairs, or None to omit the table.
-    checkpoint_config: Checkpoint config; scalar entries form a table and each
-      nested dict becomes its own fenced-JSON block.
-
-  Returns:
-    The configuration rendered as a markdown string.
-  """
-  lines = [f"## {benchmark_name}", ""]
-
-  def _table(title: str, items: list[tuple[str, Any]]) -> None:
-    lines.append(f"### {title}")
-    lines.append("")
-    lines.append("| field | value |")
-    lines.append("|---|---|")
-    for k, v in items:
-      lines.append(f"| `{k}` | `{v}` |")
-    lines.append("")
-
-  if benchmark_options:
-    _table(
-        "Benchmark options",
-        [(k, v) for k, v in sorted(benchmark_options.items())],
-    )
-
-  if checkpoint_config:
-    scalar_items = []
-    nested_items = []
-    for k, v in sorted(checkpoint_config.items()):
-      if isinstance(v, dict):
-        nested_items.append((k, v))
-      else:
-        scalar_items.append((k, v))
-    if scalar_items:
-      _table("Checkpoint config", scalar_items)
-    for k, v in nested_items:
-      lines.append(f"### Checkpoint config — `{k}`")
-      lines.append("")
-      lines.append("```json")
-      lines.append(json.dumps(v, indent=2, sort_keys=True))
-      lines.append("```")
-      lines.append("")
-  return "\n".join(lines)
-
-
-# TODO(b/519204863): Move rendering and related changes to a separate file.
-def _render_aggregated_metrics_markdown(
-    benchmark_name: str,
-    aggregated_stats_dict: dict[str, "AggregatedStats"],
-    metric_units: dict[str, str],
-    host_label: str | None = None,
-) -> str:
-  """Renders the aggregated metrics as a markdown table grouped by `/` prefix.
-
-  TB's Text dashboard renders markdown — a proper table is dramatically
-  more readable than the previous `<pre>` raw dump, and grouping by
-  numbered prefix (`1_overview/`, `2_save_breakdown/`, …) mirrors the
-  Scalars-view navigation so a reader can locate a metric the same way
-  in both surfaces.
-
-  Args:
-    benchmark_name: Title rendered as the top-level heading.
-    aggregated_stats_dict: Metric tag -> aggregated stats to tabulate.
-    metric_units: Metric tag -> unit string shown alongside each value.
-    host_label: When set, lands in the markdown header so a reader who
-      selected multiple per-host runs can tell whose aggregates they're
-      looking at.
-
-  Returns:
-    The aggregated metrics rendered as a markdown string.
-  """
-  if not aggregated_stats_dict:
-    return "_No successful runs to aggregate._"
-
-  groups: dict[str, list[str]] = collections.defaultdict(list)
-  for key in sorted(aggregated_stats_dict):
-    head, _, _ = key.partition("/")
-    section = head if "/" in key else "_other_"
-    groups[section].append(key)
-
-  suffix = f" — {host_label}" if host_label else ""
-  lines = [f"## {benchmark_name} — aggregated metrics{suffix}", ""]
-  for section in sorted(groups):
-    lines.append(f"### {section}")
-    lines.append("")
-    lines.append("| metric | mean | ± std | min | max | n | unit |")
-    lines.append("|---|---:|---:|---:|---:|---:|---|")
-    for key in groups[section]:
-      stats = aggregated_stats_dict[key]
-      unit = metric_units.get(key, "")
-      leaf = key.split("/", 1)[1] if "/" in key else key
-      lines.append(
-          f"| `{leaf}` | {stats.mean:.4f} | {stats.std:.4f} |"
-          f" {stats.min:.4f} | {stats.max:.4f} | {stats.count} | {unit} |"
-      )
-    lines.append("")
-  return "\n".join(lines)
+# Markdown card renderers live in markdown_cards.py.
 
 
 @dataclasses.dataclass
@@ -872,34 +660,10 @@ class MetricsManager:
       tag = "error"
       writer.write_texts(step=step, texts={tag: f"<pre>{repr(error)}</pre>"})
 
-    # Configuration text + HParams summary are SUITE-level (identical on
-    # every host), so only the primary host writes them. Otherwise every
-    # per-host writer dir gets a duplicate card, cluttering the Text and
-    # HParams tabs and adding N identical Parallel-Coordinates rows.
-    is_primary = multihost.get_process_index() == 0
-    if step == 0 and benchmark_options and is_primary:
-      if dataclasses.is_dataclass(benchmark_options):
-        opt_dict = dataclasses.asdict(benchmark_options)
-      else:
-        opt_dict = benchmark_options
-
-      if dataclasses.is_dataclass(checkpoint_config):
-        config_dict = dataclasses.asdict(checkpoint_config)
-      elif isinstance(checkpoint_config, dict):
-        config_dict = checkpoint_config
-      else:
-        config_dict = None
-
-      writer.write_texts(
-          step=0,
-          texts={
-              "configuration": _render_configuration_markdown(
-                  benchmark_name, opt_dict, config_dict
-              ),
-          },
-      )
-      if hparams_dict := _options_to_hparams(benchmark_options):
-        writer.write_hparams(hparams_dict)
+    # Configuration + HParams + aggregated_metrics are SUITE-level cards
+    # written once to the __summary__ writer by _aggregate_and_write_summary,
+    # so per-host writers carry scalars only. Keeps the host_N runs lean and
+    # makes __summary__ self-contained in the Text and HParams tabs.
     writer.flush()
 
   def _aggregate_metrics(
@@ -994,33 +758,16 @@ class MetricsManager:
   def _write_aggregated_to_tensorboard(self) -> None:
     """Writes each benchmark's aggregated metrics to TensorBoard as text."""
     logging.info("Writing aggregated metrics to TensorBoard...")
-    host_label = (
-        f"host_{multihost.get_process_index()}"
-        if self._enable_per_host_metrics
-        else None
-    )
     for benchmark_name, results in self._runs.items():
-      writer = self._get_writer(benchmark_name)
-      aggregated_stats_dict, metric_units = self._aggregate_metrics(results)
-      aggregated_metrics_str = _render_aggregated_metrics_markdown(
-          benchmark_name,
-          aggregated_stats_dict,
-          metric_units,
-          host_label=host_label,
-      )
-      writer.write_texts(
-          step=0,
-          texts={"aggregated_metrics": aggregated_metrics_str},
-      )
-      writer.flush()
-      writer.close()
-
-      # Cross-host gather + summary writer. Lives outside the per-host
-      # writer scope above so the aggregates land in a sibling __summary__
-      # run that TB can compare against any individual host run.
+      # Cross-host gather + summary writes (scorecard / configuration /
+      # aggregated_metrics / HParams / aggregate scalars). In per-host
+      # mode this opens its own __summary__ writer; in legacy mode it
+      # reuses self._writers[benchmark_name] so the cards land on the
+      # same legacy run dir.
       self._aggregate_and_write_summary(benchmark_name, results)
-    # Clear writers after closing to prevent reuse of closed writers if called
-    # again.
+    for w in self._writers.values():
+      w.flush()
+      w.close()
     self._writers.clear()
     logging.info("Finished writing metrics to TensorBoard.")
 
@@ -1062,8 +809,13 @@ class MetricsManager:
     Honest at scale: the "max" entry is the MLPerf-shape headline number
     (slowest rank wins for time, smallest rank for throughput — callers
     pick the relevant column per metric).
+
+    When `enable_per_host_metrics` is False the cross-host gather collapses
+    to a single-row matrix (this host = all hosts), but the scorecard /
+    configuration / aggregated_metrics cards still write to the legacy
+    single writer — they're suite-level info, not per-host.
     """
-    if not self._enable_per_host_metrics or self._tensorboard_dir is None:
+    if self._tensorboard_dir is None:
       return
 
     metrics_collector: dict[str, list[float]] = collections.defaultdict(list)
@@ -1085,16 +837,18 @@ class MetricsManager:
     )
 
     # Filesystem-based gather: each host drops its per-host means as a JSON
-    # sidecar under its per-host writer dir; primary reads them all back.
-    # This avoids jax.distributed allgather (whose Gloo backend has been
-    # flaky around process-shutdown in this docker harness) and works on
-    # any shared fs the per-host writers already use — local mount, GCS,
-    # NFS, etc.
+    # sidecar; primary reads them all back. Avoids jax.distributed allgather
+    # (Gloo gets flaky around process shutdown in our docker harness) and
+    # works on any shared filesystem the per-host writers already use.
     host_idx = multihost.get_process_index()
-    host_dir = self._tensorboard_dir / benchmark_name / f"host_{host_idx}"
+    if self._enable_per_host_metrics:
+      sidecar_root = self._tensorboard_dir / benchmark_name / f"host_{host_idx}"
+    else:
+      sidecar_root = self._tensorboard_dir / benchmark_name / "_per_host_means"
+      sidecar_root = sidecar_root / f"host_{host_idx}"
     try:
-      host_dir.mkdir(parents=True, exist_ok=True)
-      (host_dir / "_per_host_means.json").write_text(
+      sidecar_root.mkdir(parents=True, exist_ok=True)
+      (sidecar_root / "_per_host_means.json").write_text(
           json.dumps({
               "keys": canonical_keys,
               "means": per_host_means.tolist(),
@@ -1106,9 +860,12 @@ class MetricsManager:
     multihost.sync_global_processes(f"metrics:summary:{benchmark_name}")
 
     if host_idx == 0:
-      benchmark_dir = self._tensorboard_dir / benchmark_name
+      if self._enable_per_host_metrics:
+        gather_root = self._tensorboard_dir / benchmark_name
+      else:
+        gather_root = self._tensorboard_dir / benchmark_name / "_per_host_means"
       per_host_dicts: list[dict[str, float]] = []
-      for host_subdir in sorted(benchmark_dir.iterdir()):
+      for host_subdir in sorted(gather_root.iterdir()):
         if not host_subdir.name.startswith("host_"):
           continue
         sidecar = host_subdir / "_per_host_means.json"
@@ -1133,40 +890,94 @@ class MetricsManager:
 
         aggregates = _summary_aggregates(all_hosts_arr, union_keys)
         if aggregates:
-          summary_writer = metric_writers.create_default_writer(
-              self._tensorboard_dir,
-              collection=f"{benchmark_name}/__summary__",
-          )
+          # In per-host mode the summary writer is a sibling of the host_N
+          # runs at __summary__/. In legacy mode there's a single writer per
+          # benchmark and the summary cards just land on it — reuse the
+          # cached writer instead of creating a parallel one.
+          if self._enable_per_host_metrics:
+            summary_writer = metric_writers.create_default_writer(
+                self._tensorboard_dir,
+                collection=f"{benchmark_name}/__summary__",
+            )
+            summary_writer_owned = True
+          else:
+            summary_writer = self._get_writer(benchmark_name)
+            summary_writer_owned = False
           try:
-            # Only the aggregate scalars (max/min/mean/p50/p99) land in the
-            # summary. A separate write_histograms call would surface in
-            # TB's Histograms / Distributions tabs but those views are
-            # designed to plot percentile bands or histograms ACROSS STEPS
-            # — at step 0 only they collapse to a degenerate line and look
-            # broken to anyone clicking the tab. Users who want a per-host
-            # visual comparison select the host_N runs in the left rail
-            # and overlay them in Time Series.
+            # Aggregate scalars (max/min/mean/p50/p99). Histograms are
+            # intentionally NOT written — TB's Distributions / Histograms
+            # views plot over a step axis and collapse to empty at step 0.
             for key, stats in aggregates.items():
               scalars = {
                   f"{key}_{stat}": value for stat, value in stats.items()
               }
               summary_writer.write_scalars(step=0, scalars=scalars)
 
-            # Scorecard with headline numbers + inventory + manifest. The
-            # scorecard is the thing people screenshot for PRs/reports;
-            # everything else is plumbing.
-            inventory = self._inventories.get(benchmark_name)
-            manifest = self._suite_run_manifest
-            scorecard_md = _render_scorecard_markdown(
-                benchmark_name, aggregates, inventory, manifest
-            )
+            # Scorecard: the screenshot-able card with headline numbers
+            # + inventory + run manifest.
             summary_writer.write_texts(
-                step=0, texts={"scorecard": scorecard_md}
+                step=0,
+                texts={
+                    "scorecard": markdown_cards.render_scorecard(
+                        benchmark_name,
+                        aggregates,
+                        self._inventories.get(benchmark_name),
+                        self._suite_run_manifest,
+                    )
+                },
+            )
+
+            # Configuration markdown: options + checkpoint config.
+            benchmark_options = self._benchmark_options.get(benchmark_name)
+            if benchmark_options is not None:
+              opt_dict = (
+                  dataclasses.asdict(benchmark_options)
+                  if dataclasses.is_dataclass(benchmark_options)
+                  else (
+                      benchmark_options
+                      if isinstance(benchmark_options, dict)
+                      else None
+                  )
+              )
+              cc = self._checkpoint_configs.get(benchmark_name)
+              config_dict = (
+                  dataclasses.asdict(cc)
+                  if dataclasses.is_dataclass(cc)
+                  else (cc if isinstance(cc, dict) else None)
+              )
+              if opt_dict is not None:
+                summary_writer.write_texts(
+                    step=0,
+                    texts={
+                        "configuration": markdown_cards.render_configuration(
+                            benchmark_name, opt_dict, config_dict
+                        )
+                    },
+                )
+              hparams_dict = markdown_cards.options_to_hparams(
+                  benchmark_options
+              )
+              if hparams_dict:
+                summary_writer.write_hparams(hparams_dict)
+
+            # Aggregated metrics markdown table (mean ± std per metric
+            # across repeats).
+            stats_dict, units_dict = self._aggregate_metrics(results)
+            summary_writer.write_texts(
+                step=0,
+                texts={
+                    "aggregated_metrics": (
+                        markdown_cards.render_aggregated_metrics(
+                            benchmark_name, stats_dict, units_dict
+                        )
+                    )
+                },
             )
 
             summary_writer.flush()
           finally:
-            summary_writer.close()
+            if summary_writer_owned:
+              summary_writer.close()
 
     # Final barrier so non-primaries don't exit while primary is still
     # writing the summary card. Without this, the coordinator marks the
