@@ -366,6 +366,74 @@ class MetricsManagerTest(parameterized.TestCase):
     mock_writer.flush.assert_called_once()
 
 
+class ScorecardMarkdownTest(parameterized.TestCase):
+  """The scorecard pulls headline numbers from the cross-host aggregates,
+  appends inventory + manifest sections, and falls back gracefully when
+  inputs are missing."""
+
+  _AGGS = {
+      'save_background_4_throughput/save_total_gbps': {
+          'max': 22.4, 'min': 18.0, 'mean': 20.1, 'p50': 20.2, 'p99': 22.3,
+      },
+      'load_4_throughput/load_total_gbps': {
+          'max': 18.9, 'min': 17.0, 'mean': 18.0, 'p50': 18.1, 'p99': 18.8,
+      },
+      'save_background_5_inventory/save_total_gb': {
+          'max': 140.2, 'min': 140.2, 'mean': 140.2,
+      },
+      'save_blocking_2_save_breakdown/blocking_async_s': {
+          'max': 4.21, 'min': 4.0, 'mean': 4.1,
+      },
+  }
+
+  def test_headline_save_load_throughput_in_output(self):
+    out = metric_lib._render_scorecard_markdown('llama70b', self._AGGS, None, None)
+    self.assertIn('llama70b', out)
+    self.assertIn('Save total throughput', out)
+    self.assertIn('Load throughput', out)
+    self.assertIn('22.4', out)
+    self.assertIn('18.9', out)
+
+  def test_inventory_section_appears_when_provided(self):
+    from orbax.checkpoint._src.testing.benchmarks.core import inventory as inv_lib
+    inv = inv_lib.CheckpointInventory(
+        total_bytes=140 * 1024 ** 3, file_count=4096,
+        small_file_count=128, small_file_pct=0.031,
+        largest_file_bytes=64 * 1024 ** 2, smallest_file_bytes=32,
+        format={'ocdbt': 4090, 'metadata': 6},
+    )
+    out = metric_lib._render_scorecard_markdown('llama70b', self._AGGS, inv, None)
+    self.assertIn('### Inventory', out)
+    self.assertIn('4,096', out)         # file_count formatted with comma
+    self.assertIn('3.1%', out)          # small_file_pct rendered as %
+    self.assertIn('ocdbt', out)
+
+  def test_inventory_section_omitted_when_none(self):
+    out = metric_lib._render_scorecard_markdown('llama70b', self._AGGS, None, None)
+    self.assertNotIn('### Inventory', out)
+
+  def test_manifest_section_appears_when_provided(self):
+    from orbax.checkpoint._src.testing.benchmarks.core import run_manifest as rm_lib
+    m = rm_lib.RunManifest(
+        captured_at='2026-05-25T20:00:00+00:00', hostname='h',
+        git_sha='abc123', git_dirty=False,
+        jax_version='0.10.1', orbax_version='0.11.40',
+        tensorstore_version='0.1.84', jax_process_count=4,
+        jax_process_index=0, jax_device_count=8, jax_device_kind='cpu',
+        xla_flags='', libtpu_init_args='',
+    )
+    out = metric_lib._render_scorecard_markdown('llama70b', self._AGGS, None, m)
+    self.assertIn('## Run manifest', out)
+    self.assertIn('abc123', out)
+    self.assertIn('0.10.1', out)
+
+  def test_no_aggregates_renders_skeleton(self):
+    out = metric_lib._render_scorecard_markdown('llama70b', {}, None, None)
+    self.assertIn('llama70b', out)
+    # No headline numbers section when there's nothing to put in it.
+    self.assertNotIn('Save throughput', out)
+
+
 class MlperfAggregatesTest(parameterized.TestCase):
   """Cross-host aggregation math: max wins, p50/p99 from the host distribution."""
 

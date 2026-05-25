@@ -31,6 +31,7 @@ from clu import metric_writers
 from etils import epath
 import numpy as np
 from orbax.checkpoint._src.testing.benchmarks.core import multihost
+from orbax.checkpoint._src.testing.benchmarks.core import run_manifest as run_manifest_lib
 import psutil
 import tensorstore as ts
 
@@ -517,6 +518,84 @@ def _summary_aggregates(
   return out
 
 
+_SCORECARD_HEADLINE_KEYS: tuple[tuple[str, str, str], ...] = (
+    # Keys carry the measure() operation prefix (save_blocking_, save_background_,
+    # load_) that `_add_results` splices in front of the namespaced metric key.
+    # (aggregate key, label, stat to use as the headline)
+    ("save_blocking_4_throughput/save_blocking_gbps",
+     "Save blocking throughput (max GiB/s)", "max"),
+    ("save_background_4_throughput/save_total_gbps",
+     "Save total throughput (max GiB/s)", "max"),
+    ("load_4_throughput/load_total_gbps",
+     "Load throughput (max GiB/s)", "max"),
+    ("load_4_throughput/load_per_host_gbps",
+     "Load per-host throughput (max GiB/s)", "max"),
+    ("save_background_5_inventory/save_total_gb",
+     "Save total per host (GiB)", "max"),
+    ("load_5_inventory/load_total_gb",
+     "Load total per host (GiB)", "max"),
+    ("save_blocking_2_save_breakdown/blocking_async_s",
+     "Save blocking (slowest host, s)", "max"),
+    ("load_3_load_breakdown/blocking_s",
+     "Load blocking (slowest host, s)", "max"),
+    ("save_blocking_7_overhead/sync_global_devices_s",
+     "Sync-barrier overhead (slowest host, s)", "max"),
+)
+
+
+def _render_scorecard_markdown(
+    benchmark_name: str,
+    aggregates: dict[str, dict[str, float]],
+    inventory: "Any | None",
+    manifest: "Any | None",
+) -> str:
+  """Renders the per-benchmark scorecard.
+
+  Headline metrics come from the cross-host aggregate dict
+  (`{metric_key → {stat_name → value}}`) keyed off the curated list above.
+  Inventory + manifest sections are included only when provided so the card
+  stays compact for benchmarks that opted out of those captures.
+  """
+  lines = [f"## {benchmark_name} — scorecard", ""]
+
+  headline_rows = []
+  for agg_key, label, stat in _SCORECARD_HEADLINE_KEYS:
+    if agg_key in aggregates and stat in aggregates[agg_key]:
+      headline_rows.append((label, aggregates[agg_key][stat]))
+
+  if headline_rows:
+    lines.extend(["### Headline numbers", ""])
+    lines.append("| metric | value |")
+    lines.append("|---|---:|")
+    for label, value in headline_rows:
+      lines.append(f"| {label} | {value:.4f} |")
+    lines.append("")
+
+  if inventory is not None:
+    lines.extend(["### Inventory", ""])
+    lines.append("| field | value |")
+    lines.append("|---|---:|")
+    total_gb = inventory.total_bytes / (1024 ** 3)
+    lines.append(f"| total bytes | {total_gb:.2f} GiB |")
+    lines.append(f"| file count | {inventory.file_count:,} |")
+    small_pct = inventory.small_file_pct * 100
+    canary = "✓" if small_pct < 10 else "⚠ chunk_byte_size too small?"
+    lines.append(f"| small files <1 MiB | {small_pct:.1f}% {canary} |")
+    if inventory.largest_file_bytes > 0:
+      lines.append(
+          f"| largest file | {inventory.largest_file_bytes / (1024**2):.2f} MiB |"
+      )
+    if inventory.format:
+      fmt_str = ", ".join(f"{k}={v}" for k, v in sorted(inventory.format.items()))
+      lines.append(f"| format breakdown | {fmt_str} |")
+    lines.append("")
+
+  if manifest is not None:
+    lines.append(manifest.as_markdown())
+
+  return "\n".join(lines)
+
+
 def _render_configuration_markdown(
     benchmark_name: str,
     benchmark_options: dict[str, Any] | None,
@@ -686,6 +765,14 @@ class MetricsManager:
     self._tensorboard_dir = tensorboard_dir
     self._enable_per_host_metrics = enable_per_host_metrics
     self._writers: dict[str, Any] = {}
+    # Inventory is suite-level (one per benchmark; the first non-None we see
+    # wins) — it's the post-save filesystem walk from Benchmark.run, only
+    # collected on the primary host.
+    self._inventories: dict[str, Any] = {}
+    # Suite-level environment snapshot. Captured once at suite construction
+    # so the manifest matches the run that gets reported, not the latest
+    # state of the machine when generate_report is called.
+    self._suite_run_manifest = run_manifest_lib.capture_run_manifest()
 
   def add_result(
       self,
@@ -695,6 +782,7 @@ class MetricsManager:
       benchmark_options: Any | None = None,
       checkpoint_config: Any | None = None,
       error: Exception | None = None,
+      inventory: Any | None = None,
   ):
     """Adds metrics from a single benchmark run/repetition.
 
@@ -704,12 +792,17 @@ class MetricsManager:
       benchmark_options: The BenchmarkOptions used for this run.
       checkpoint_config: The CheckpointConfig used for this run.
       error: An exception if the run failed, otherwise None.
+      inventory: Optional post-save CheckpointInventory; the first non-None
+        provided per benchmark wins (subsequent repeats overwrite the same
+        target dir, so the inventory is invariant across repeats).
     """
     self._runs[benchmark_name].append((metrics, error))
     if benchmark_name not in self._benchmark_options:
       self._benchmark_options[benchmark_name] = benchmark_options
     if benchmark_name not in self._checkpoint_configs:
       self._checkpoint_configs[benchmark_name] = checkpoint_config
+    if inventory is not None and benchmark_name not in self._inventories:
+      self._inventories[benchmark_name] = inventory
 
     if self._tensorboard_dir:
       self._write_result_to_tensorboard(
@@ -1058,6 +1151,19 @@ class MetricsManager:
                   f"{key}_{stat}": value for stat, value in stats.items()
               }
               summary_writer.write_scalars(step=0, scalars=scalars)
+
+            # Scorecard with headline numbers + inventory + manifest. The
+            # scorecard is the thing people screenshot for PRs/reports;
+            # everything else is plumbing.
+            inventory = self._inventories.get(benchmark_name)
+            manifest = self._suite_run_manifest
+            scorecard_md = _render_scorecard_markdown(
+                benchmark_name, aggregates, inventory, manifest
+            )
+            summary_writer.write_texts(
+                step=0, texts={"scorecard": scorecard_md}
+            )
+
             summary_writer.flush()
           finally:
             summary_writer.close()
