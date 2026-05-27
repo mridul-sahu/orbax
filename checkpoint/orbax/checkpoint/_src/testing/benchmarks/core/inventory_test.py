@@ -67,8 +67,12 @@ class ScanCheckpointTest(parameterized.TestCase):
     _write(d / 'state' / '_sharding', 32)
     _write(d / '_CHECKPOINT_METADATA', 16)
     inv = inventory.scan_checkpoint(d)
-    self.assertEqual(inv.format['ocdbt'], 3)  # ocdbt.process_* and manifest.ocdbt
-    self.assertEqual(inv.format['metadata'], 3)  # _METADATA + _sharding + _CHECKPOINT_METADATA
+    self.assertEqual(
+        inv.format['ocdbt'], 3
+    )  # ocdbt.process_* and manifest.ocdbt
+    self.assertEqual(
+        inv.format['metadata'], 3
+    )  # _METADATA + _sharding + _CHECKPOINT_METADATA
     # Remaining d/leaf_chunk counts as 'other'.
     self.assertEqual(inv.format.get('other', 0), 1)
 

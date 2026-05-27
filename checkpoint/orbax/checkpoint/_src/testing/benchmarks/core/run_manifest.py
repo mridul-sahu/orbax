@@ -33,11 +33,17 @@ import subprocess
 
 def _safe_check_output(cmd: list[str]) -> str:
   try:
-    return subprocess.check_output(
-        cmd, stderr=subprocess.DEVNULL, timeout=5
-    ).decode("utf-8").strip()
-  except (subprocess.CalledProcessError, FileNotFoundError, OSError,
-          subprocess.TimeoutExpired):
+    return (
+        subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=5)
+        .decode("utf-8")
+        .strip()
+    )
+  except (
+      subprocess.CalledProcessError,
+      FileNotFoundError,
+      OSError,
+      subprocess.TimeoutExpired,
+  ):
     return ""
 
 
@@ -53,6 +59,7 @@ def _capture_topology() -> tuple[int, int, int, str]:
   """Best-effort jax topology snapshot."""
   try:
     import jax  # pylint: disable=g-import-not-at-top
+
     devices = jax.devices()
     kind = devices[0].device_kind if devices else "unknown"
     return (

@@ -38,6 +38,7 @@ class CaptureRunManifestTest(parameterized.TestCase):
       if cmd[:2] == ['git', 'status']:
         return b' M some_file.py\n'  # dirty tree
       raise subprocess.CalledProcessError(1, cmd)
+
     mock_check_output.side_effect = _fake
     m = run_manifest.capture_run_manifest()
     self.assertEqual(m.git_sha, 'abc123def456')
@@ -51,13 +52,17 @@ class CaptureRunManifestTest(parameterized.TestCase):
       if cmd[:2] == ['git', 'status']:
         return b''  # clean
       raise subprocess.CalledProcessError(1, cmd)
+
     mock_check_output.side_effect = _fake
     m = run_manifest.capture_run_manifest()
     self.assertEqual(m.git_sha, 'deadbeef')
     self.assertFalse(m.git_dirty)
 
-  @mock.patch.object(subprocess, 'check_output',
-                     side_effect=subprocess.CalledProcessError(128, ['git']))
+  @mock.patch.object(
+      subprocess,
+      'check_output',
+      side_effect=subprocess.CalledProcessError(128, ['git']),
+  )
   def test_no_git_falls_through_to_unknown(self, _mock_check_output):
     m = run_manifest.capture_run_manifest()
     self.assertEqual(m.git_sha, 'unknown')

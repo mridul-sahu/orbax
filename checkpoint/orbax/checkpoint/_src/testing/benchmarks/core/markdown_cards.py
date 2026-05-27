@@ -40,24 +40,43 @@ _SCORECARD_HEADLINE_KEYS: tuple[tuple[str, str, str], ...] = (
     # save_background_, load_) that MetricsManager._add_results splices in
     # front of the namespaced metric key.
     # (aggregate key, label, stat to use as the headline)
-    ("save_blocking_4_throughput/save_blocking_gbps",
-     "Save blocking throughput (max GiB/s)", "max"),
-    ("save_background_4_throughput/save_total_gbps",
-     "Save total throughput (max GiB/s)", "max"),
-    ("load_4_throughput/load_total_gbps",
-     "Load throughput (max GiB/s)", "max"),
-    ("load_4_throughput/load_per_host_gbps",
-     "Load per-host throughput (max GiB/s)", "max"),
-    ("save_background_5_inventory/save_total_gb",
-     "Save total per host (GiB)", "max"),
-    ("load_5_inventory/load_total_gb",
-     "Load total per host (GiB)", "max"),
-    ("save_blocking_2_save_breakdown/blocking_async_s",
-     "Save blocking (slowest host, s)", "max"),
-    ("load_3_load_breakdown/blocking_s",
-     "Load blocking (slowest host, s)", "max"),
-    ("save_blocking_7_overhead/sync_global_devices_s",
-     "Sync-barrier overhead (slowest host, s)", "max"),
+    (
+        "save_blocking_4_throughput/save_blocking_gbps",
+        "Save blocking throughput (max GiB/s)",
+        "max",
+    ),
+    (
+        "save_background_4_throughput/save_total_gbps",
+        "Save total throughput (max GiB/s)",
+        "max",
+    ),
+    ("load_4_throughput/load_total_gbps", "Load throughput (max GiB/s)", "max"),
+    (
+        "load_4_throughput/load_per_host_gbps",
+        "Load per-host throughput (max GiB/s)",
+        "max",
+    ),
+    (
+        "save_background_5_inventory/save_total_gb",
+        "Save total per host (GiB)",
+        "max",
+    ),
+    ("load_5_inventory/load_total_gb", "Load total per host (GiB)", "max"),
+    (
+        "save_blocking_2_save_breakdown/blocking_async_s",
+        "Save blocking (slowest host, s)",
+        "max",
+    ),
+    (
+        "load_3_load_breakdown/blocking_s",
+        "Load blocking (slowest host, s)",
+        "max",
+    ),
+    (
+        "save_blocking_7_overhead/sync_global_devices_s",
+        "Sync-barrier overhead (slowest host, s)",
+        "max",
+    ),
 )
 
 
@@ -87,7 +106,7 @@ def render_scorecard(
     lines.extend(["### Inventory", ""])
     lines.append("| field | value |")
     lines.append("|---|---:|")
-    total_gb = inventory.total_bytes / (1024 ** 3)
+    total_gb = inventory.total_bytes / (1024**3)
     lines.append(f"| total bytes | {total_gb:.2f} GiB |")
     lines.append(f"| file count | {inventory.file_count:,} |")
     small_pct = inventory.small_file_pct * 100
@@ -95,7 +114,8 @@ def render_scorecard(
     lines.append(f"| small files <1 MiB | {small_pct:.1f}% {canary} |")
     if inventory.largest_file_bytes > 0:
       lines.append(
-          f"| largest file | {inventory.largest_file_bytes / (1024**2):.2f} MiB |"
+          f"| largest file | {inventory.largest_file_bytes / (1024**2):.2f}"
+          " MiB |"
       )
     if inventory.format:
       fmt_str = ", ".join(
