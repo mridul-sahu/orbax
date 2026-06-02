@@ -217,8 +217,14 @@ class MetricsManagerTest(parameterized.TestCase):
     mock_writer = mock.Mock()
     mock_create_writer.return_value = mock_writer
     temp_dir = epath.Path(self.create_tempdir().full_path)
+    # Legacy single-writer path simplifies the call-list assertions below;
+    # per-host fan-out is exercised separately in
+    # MetricsManagerPerHostWriterTest.
     manager = metric_lib.MetricsManager(
-        name='TBSuite', num_repeats=2, tensorboard_dir=temp_dir
+        name='TBSuite',
+        num_repeats=2,
+        tensorboard_dir=temp_dir,
+        enable_per_host_metrics=False,
     )
 
     bench1_name = 'bench1'
@@ -337,8 +343,12 @@ class MetricsManagerTest(parameterized.TestCase):
     mock_writer = mock.Mock()
     mock_create_writer.return_value = mock_writer
     temp_dir = epath.Path(self.create_tempdir().full_path)
+    # Legacy path keeps the contract simple to assert against.
     manager = metric_lib.MetricsManager(
-        name='IncSuite', num_repeats=1, tensorboard_dir=temp_dir
+        name='IncSuite',
+        num_repeats=1,
+        tensorboard_dir=temp_dir,
+        enable_per_host_metrics=False,
     )
 
     m1 = metric_lib.Metrics()
@@ -354,6 +364,117 @@ class MetricsManagerTest(parameterized.TestCase):
         step=0, scalars={'acc_': 0.9}
     )
     mock_writer.flush.assert_called_once()
+
+
+class MlperfAggregatesTest(parameterized.TestCase):
+  """Cross-host aggregation math: max wins, p50/p99 from the host distribution."""
+
+  def test_aggregates_compute_max_min_mean_p50_p99(self):
+    keys = ['op_4_throughput/save_total_gbps', 'op_3_load_breakdown/blocking_s']
+    per_host_matrix = np.array([
+        [22.4, 4.21],
+        [21.8, 4.50],
+        [18.0, 5.10],
+        [7.8, 8.20],  # straggler
+    ])
+    out = metric_lib._summary_aggregates(per_host_matrix, keys)
+    self.assertEqual(set(out), set(keys))
+    save = out['op_4_throughput/save_total_gbps']
+    self.assertAlmostEqual(save['max'], 22.4)
+    self.assertAlmostEqual(save['min'], 7.8)
+    self.assertAlmostEqual(save['mean'], 17.5)
+    self.assertAlmostEqual(save['p50'], 19.9)
+    self.assertAlmostEqual(save['p99'], 22.382)
+    load = out['op_3_load_breakdown/blocking_s']
+    self.assertAlmostEqual(load['max'], 8.20)
+    self.assertAlmostEqual(load['min'], 4.21)
+
+  def test_aggregates_single_host_skips_percentiles(self):
+    out = metric_lib._summary_aggregates(np.array([[1.5]]), ['m'])
+    self.assertEqual(out['m']['max'], 1.5)
+    self.assertEqual(out['m']['min'], 1.5)
+    self.assertEqual(out['m']['mean'], 1.5)
+    self.assertNotIn('p50', out['m'])
+    self.assertNotIn('p99', out['m'])
+
+  def test_aggregates_empty_matrix_returns_empty(self):
+    self.assertEqual(metric_lib._summary_aggregates(np.zeros((0, 0)), []), {})
+
+
+class MetricsManagerPerHostWriterTest(parameterized.TestCase):
+  """Per-host writer plumbing: each process writes to its own subdir."""
+
+  @mock.patch.object(metric_lib.multihost, 'get_process_index', return_value=3)
+  @mock.patch(
+      'orbax.checkpoint._src.testing.benchmarks.core.metric.metric_writers.create_default_writer'
+  )
+  def test_per_host_writer_path_includes_host_suffix(
+      self, mock_create_writer, _mock_idx
+  ):
+    mock_writer = mock.Mock()
+    mock_create_writer.return_value = mock_writer
+    temp_dir = epath.Path(self.create_tempdir().full_path)
+    manager = metric_lib.MetricsManager(
+        name='Suite',
+        num_repeats=1,
+        tensorboard_dir=temp_dir,
+        enable_per_host_metrics=True,
+    )
+    m = metric_lib.Metrics()
+    m.results['op_0_basics/time_s'] = (1.0, 's')
+    manager.add_result('bench1', m)
+    args, kwargs = mock_create_writer.call_args
+    # Per-host path is encoded in collection (clu plants events under
+    # <logdir>/<collection>/), not duplicated in logdir.
+    self.assertEqual(args[0], temp_dir)
+    self.assertEqual(kwargs.get('collection'), 'bench1/host_3')
+
+  @mock.patch.object(metric_lib.multihost, 'get_process_index', return_value=2)
+  @mock.patch(
+      'orbax.checkpoint._src.testing.benchmarks.core.metric.metric_writers.create_default_writer'
+  )
+  def test_per_host_disabled_keeps_legacy_behavior(
+      self, mock_create_writer, _mock_idx
+  ):
+    mock_writer = mock.Mock()
+    mock_create_writer.return_value = mock_writer
+    temp_dir = epath.Path(self.create_tempdir().full_path)
+    manager = metric_lib.MetricsManager(
+        name='Suite',
+        num_repeats=1,
+        tensorboard_dir=temp_dir,
+        enable_per_host_metrics=False,
+    )
+    m = metric_lib.Metrics()
+    m.results['op_0_basics/time_s'] = (1.0, 's')
+    manager.add_result('bench1', m)
+    args, kwargs = mock_create_writer.call_args
+    # No host_<idx> in the leaf segment; non-primary hosts use just_logging.
+    self.assertEqual(args[0], temp_dir)
+    self.assertEqual(kwargs.get('collection'), 'bench1')
+    self.assertTrue(kwargs.get('just_logging'))
+
+  @mock.patch.object(metric_lib.multihost, 'get_process_index', return_value=0)
+  @mock.patch(
+      'orbax.checkpoint._src.testing.benchmarks.core.metric.metric_writers.create_default_writer'
+  )
+  def test_per_host_primary_still_writes(self, mock_create_writer, _mock_idx):
+    mock_writer = mock.Mock()
+    mock_create_writer.return_value = mock_writer
+    temp_dir = epath.Path(self.create_tempdir().full_path)
+    manager = metric_lib.MetricsManager(
+        name='Suite',
+        num_repeats=1,
+        tensorboard_dir=temp_dir,
+        enable_per_host_metrics=True,
+    )
+    m = metric_lib.Metrics()
+    m.results['op_0_basics/time_s'] = (1.0, 's')
+    manager.add_result('bench1', m)
+    args, kwargs = mock_create_writer.call_args
+    self.assertEqual(args[0], temp_dir)
+    self.assertEqual(kwargs.get('collection'), 'bench1/host_0')
+    self.assertFalse(kwargs.get('just_logging', False))
 
 
 @dataclasses.dataclass(frozen=True)

@@ -482,6 +482,41 @@ def _options_to_hparams(options: Any) -> dict[str, bool | int | float | str]:
   return out
 
 
+def _summary_aggregates(
+    per_host_matrix: np.ndarray, keys: list[str]
+) -> dict[str, dict[str, float]]:
+  """Computes per-metric aggregates across hosts.
+
+  Returns max / min / mean for every key, plus p50 and p99 when more than
+  one host's value is present. Max is the MLPerf-honest headline number
+  (slowest rank wins for time-shaped metrics; smallest rank wins for
+  throughput — callers translate per metric).
+
+  Hosts that didn't report a given metric appear as NaN in that column and
+  are skipped from that metric's aggregate (so "primary-only" events like
+  metadata_write_s still report a meaningful value even though most hosts
+  never fire the event).
+  """
+  if per_host_matrix.size == 0 or len(keys) == 0:
+    return {}
+  out: dict[str, dict[str, float]] = {}
+  for j, key in enumerate(keys):
+    column = per_host_matrix[:, j]
+    column = column[~np.isnan(column)]
+    if column.size == 0:
+      continue
+    entry = {
+        "max": float(np.max(column)),
+        "min": float(np.min(column)),
+        "mean": float(np.mean(column)),
+    }
+    if column.size > 1:
+      entry["p50"] = float(np.percentile(column, 50))
+      entry["p99"] = float(np.percentile(column, 99))
+    out[key] = entry
+  return out
+
+
 def _render_configuration_markdown(
     benchmark_name: str,
     benchmark_options: dict[str, Any] | None,
@@ -545,6 +580,7 @@ def _render_aggregated_metrics_markdown(
     benchmark_name: str,
     aggregated_stats_dict: dict[str, "AggregatedStats"],
     metric_units: dict[str, str],
+    host_label: str | None = None,
 ) -> str:
   """Renders the aggregated metrics as a markdown table grouped by `/` prefix.
 
@@ -558,6 +594,9 @@ def _render_aggregated_metrics_markdown(
     benchmark_name: Title rendered as the top-level heading.
     aggregated_stats_dict: Metric tag -> aggregated stats to tabulate.
     metric_units: Metric tag -> unit string shown alongside each value.
+    host_label: When set, lands in the markdown header so a reader who
+      selected multiple per-host runs can tell whose aggregates they're
+      looking at.
 
   Returns:
     The aggregated metrics rendered as a markdown string.
@@ -571,7 +610,8 @@ def _render_aggregated_metrics_markdown(
     section = head if "/" in key else "_other_"
     groups[section].append(key)
 
-  lines = [f"## {benchmark_name} — aggregated metrics", ""]
+  suffix = f" — {host_label}" if host_label else ""
+  lines = [f"## {benchmark_name} — aggregated metrics{suffix}", ""]
   for section in sorted(groups):
     lines.append(f"### {section}")
     lines.append("")
@@ -622,6 +662,7 @@ class MetricsManager:
       name: str,
       num_repeats: int,
       tensorboard_dir: epath.Path | None = None,
+      enable_per_host_metrics: bool = True,
   ):
     """Initializes the MetricsManager.
 
@@ -630,6 +671,10 @@ class MetricsManager:
       num_repeats: The number of repetitions for each benchmark configuration.
       tensorboard_dir: The directory to write TensorBoard events to. If None,
         metrics will not be written to TensorBoard during the run.
+      enable_per_host_metrics: When True, every process opens its own writer
+        at <tensorboard_dir>/<benchmark>/host_<idx>/ so per-host scalars are
+        visible in the TB Scalars view as sibling runs. When False, only the
+        primary host writes (legacy behavior).
     """
     self._name = name
     self._num_repeats = num_repeats
@@ -639,6 +684,7 @@ class MetricsManager:
     self._benchmark_options: dict[str, Any] = {}
     self._checkpoint_configs: dict[str, Any] = {}
     self._tensorboard_dir = tensorboard_dir
+    self._enable_per_host_metrics = enable_per_host_metrics
     self._writers: dict[str, Any] = {}
 
   def add_result(
@@ -676,15 +722,33 @@ class MetricsManager:
       )
 
   def _get_writer(self, benchmark_name: str) -> Any:
-    """Gets or creates a TensorBoard writer for the given benchmark."""
-    if benchmark_name not in self._writers:
-      is_primary_host = multihost.get_process_index() == 0
-      self._writers[benchmark_name] = metric_writers.create_default_writer(
+    """Gets or creates a TensorBoard writer for the given benchmark.
+
+    When per-host metrics are enabled, every process opens its own writer
+    at `<tensorboard_dir>/<benchmark>/host_<idx>/`, surfacing each host as a
+    sibling TB run for the Distribution / Compare views. Otherwise only
+    the primary host writes (legacy behavior).
+    """
+    if benchmark_name in self._writers:
+      return self._writers[benchmark_name]
+
+    host_idx = multihost.get_process_index()
+    if self._enable_per_host_metrics:
+      # clu's create_default_writer plants events at <logdir>/<collection>/.
+      # Encoding the host suffix in collection keeps the on-disk layout flat
+      # at "<tensorboard>/<benchmark>/host_<idx>/" without double-nesting.
+      writer = metric_writers.create_default_writer(
           self._tensorboard_dir,
-          just_logging=not is_primary_host,
+          collection=f"{benchmark_name}/host_{host_idx}",
+      )
+    else:
+      writer = metric_writers.create_default_writer(
+          self._tensorboard_dir,
+          just_logging=host_idx != 0,
           collection=benchmark_name,
       )
-    return self._writers[benchmark_name]
+    self._writers[benchmark_name] = writer
+    return writer
 
   def _write_result_to_tensorboard(
       self,
@@ -715,8 +779,12 @@ class MetricsManager:
       tag = "error"
       writer.write_texts(step=step, texts={tag: f"<pre>{repr(error)}</pre>"})
 
-    # Write configuration if it's the first step
-    if step == 0 and benchmark_options:
+    # Configuration text + HParams summary are SUITE-level (identical on
+    # every host), so only the primary host writes them. Otherwise every
+    # per-host writer dir gets a duplicate card, cluttering the Text and
+    # HParams tabs and adding N identical Parallel-Coordinates rows.
+    is_primary = multihost.get_process_index() == 0
+    if step == 0 and benchmark_options and is_primary:
       if dataclasses.is_dataclass(benchmark_options):
         opt_dict = dataclasses.asdict(benchmark_options)
       else:
@@ -833,11 +901,19 @@ class MetricsManager:
   def _write_aggregated_to_tensorboard(self) -> None:
     """Writes each benchmark's aggregated metrics to TensorBoard as text."""
     logging.info("Writing aggregated metrics to TensorBoard...")
+    host_label = (
+        f"host_{multihost.get_process_index()}"
+        if self._enable_per_host_metrics
+        else None
+    )
     for benchmark_name, results in self._runs.items():
       writer = self._get_writer(benchmark_name)
       aggregated_stats_dict, metric_units = self._aggregate_metrics(results)
       aggregated_metrics_str = _render_aggregated_metrics_markdown(
-          benchmark_name, aggregated_stats_dict, metric_units
+          benchmark_name,
+          aggregated_stats_dict,
+          metric_units,
+          host_label=host_label,
       )
       writer.write_texts(
           step=0,
@@ -845,6 +921,11 @@ class MetricsManager:
       )
       writer.flush()
       writer.close()
+
+      # Cross-host gather + summary writer. Lives outside the per-host
+      # writer scope above so the aggregates land in a sibling __summary__
+      # run that TB can compare against any individual host run.
+      self._aggregate_and_write_summary(benchmark_name, results)
     # Clear writers after closing to prevent reuse of closed writers if called
     # again.
     self._writers.clear()
@@ -871,3 +952,117 @@ class MetricsManager:
     logging.info("\n".join(report_lines))
     if self._tensorboard_dir:
       self._write_aggregated_to_tensorboard()
+
+  def _aggregate_and_write_summary(
+      self,
+      benchmark_name: str,
+      results: list[tuple[Metrics, Exception | None]],
+  ) -> None:
+    """Gathers per-host metric values across processes and writes summary.
+
+    Each host contributes its mean-across-repeats value for every numeric
+    metric key. `process_allgather` builds a (host_count, metric_count)
+    matrix; the primary host computes max/min/mean (and p50/p99 when more
+    than one host is present) plus per-metric histograms and writes them
+    to <tensorboard_dir>/<benchmark>/__summary__/.
+
+    Honest at scale: the "max" entry is the MLPerf-shape headline number
+    (slowest rank wins for time, smallest rank for throughput — callers
+    pick the relevant column per metric).
+    """
+    if not self._enable_per_host_metrics or self._tensorboard_dir is None:
+      return
+
+    metrics_collector: dict[str, list[float]] = collections.defaultdict(list)
+    for m, error in results:
+      if error is None:
+        for k, (v, _unit) in m.results.items():
+          if isinstance(v, (int, float)):
+            metrics_collector[k].append(float(v))
+
+    # Do not early-return when this host has no successful metrics: every
+    # host must still reach the sync_global_processes barriers below, or a
+    # host that diverged (all runs errored for this benchmark while peers
+    # succeeded) would skip the collective and hang the rest of the run. An
+    # empty sidecar is harmless — the primary unions keys across hosts.
+    canonical_keys = sorted(metrics_collector)
+    per_host_means = np.array(
+        [float(np.mean(metrics_collector[k])) for k in canonical_keys],
+        dtype=np.float64,
+    )
+
+    # Filesystem-based gather: each host drops its per-host means as a JSON
+    # sidecar under its per-host writer dir; primary reads them all back.
+    # This avoids jax.distributed allgather (whose Gloo backend has been
+    # flaky around process-shutdown in this docker harness) and works on
+    # any shared fs the per-host writers already use — local mount, GCS,
+    # NFS, etc.
+    host_idx = multihost.get_process_index()
+    host_dir = self._tensorboard_dir / benchmark_name / f"host_{host_idx}"
+    try:
+      host_dir.mkdir(parents=True, exist_ok=True)
+      (host_dir / "_per_host_means.json").write_text(
+          json.dumps({
+              "keys": canonical_keys,
+              "means": per_host_means.tolist(),
+          })
+      )
+    except OSError as e:
+      logging.warning("Failed to write per-host means sidecar: %s", e)
+
+    multihost.sync_global_processes(f"metrics:summary:{benchmark_name}")
+
+    if host_idx == 0:
+      benchmark_dir = self._tensorboard_dir / benchmark_name
+      per_host_dicts: list[dict[str, float]] = []
+      for host_subdir in sorted(benchmark_dir.iterdir()):
+        if not host_subdir.name.startswith("host_"):
+          continue
+        sidecar = host_subdir / "_per_host_means.json"
+        if not sidecar.exists():
+          continue
+        data = json.loads(sidecar.read_text())
+        per_host_dicts.append(dict(zip(data["keys"], data["means"])))
+
+      if per_host_dicts:
+        # Union the keys across hosts; missing-on-some-hosts becomes NaN
+        # so _summary_aggregates can still compute the per-key max/p99 from
+        # the hosts that did report (e.g. metadata_write_s is primary-only
+        # but still meaningful as a headline number).
+        union_keys = sorted(set().union(*(d.keys() for d in per_host_dicts)))
+        all_hosts_arr = np.full(
+            (len(per_host_dicts), len(union_keys)), np.nan, dtype=np.float64
+        )
+        for i, d in enumerate(per_host_dicts):
+          for j, k in enumerate(union_keys):
+            if k in d:
+              all_hosts_arr[i, j] = d[k]
+
+        aggregates = _summary_aggregates(all_hosts_arr, union_keys)
+        if aggregates:
+          summary_writer = metric_writers.create_default_writer(
+              self._tensorboard_dir,
+              collection=f"{benchmark_name}/__summary__",
+          )
+          try:
+            # Only the aggregate scalars (max/min/mean/p50/p99) land in the
+            # summary. A separate write_histograms call would surface in
+            # TB's Histograms / Distributions tabs but those views are
+            # designed to plot percentile bands or histograms ACROSS STEPS
+            # — at step 0 only they collapse to a degenerate line and look
+            # broken to anyone clicking the tab. Users who want a per-host
+            # visual comparison select the host_N runs in the left rail
+            # and overlay them in Time Series.
+            for key, stats in aggregates.items():
+              scalars = {
+                  f"{key}_{stat}": value for stat, value in stats.items()
+              }
+              summary_writer.write_scalars(step=0, scalars=scalars)
+            summary_writer.flush()
+          finally:
+            summary_writer.close()
+
+    # Final barrier so non-primaries don't exit while primary is still
+    # writing the summary card. Without this, the coordinator marks the
+    # early-exiting tasks as gone and the shutdown barrier fails.
+    multihost.sync_global_processes(f"metrics:summary-done:{benchmark_name}")
