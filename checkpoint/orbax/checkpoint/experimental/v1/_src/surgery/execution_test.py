@@ -171,6 +171,49 @@ class MultiSourceMergeTest(absltest.TestCase):
     )
 
 
+class ConformToTargetTest(absltest.TestCase):
+
+  def test_flat_result_nests_to_the_target_structure(self):
+    source = {
+        "encoder.w": jnp.arange(4, dtype=jnp.float32),
+        "decoder.w": jnp.arange(4, dtype=jnp.float32) + 4,
+    }
+    target = {
+        "encoder": {"w": _sds((4,), jnp.float32)},
+        "decoder": {"w": _sds((4,), jnp.float32)},
+    }
+    result = surgery.load(source, surgery.pipeline(), target=target)
+
+    self.assertEqual(set(result), {"encoder", "decoder"})
+    np.testing.assert_array_equal(
+        np.asarray(jax.device_get(result["decoder"]["w"])),
+        np.arange(4, dtype=np.float32) + 4,
+    )
+
+
+class ResizeInitTest(absltest.TestCase):
+
+  def test_grow_with_jax_style_initializer_and_seed(self):
+    source = {"emb": jnp.arange(6, dtype=jnp.float32).reshape(2, 3)}
+    plan = surgery.pipeline(
+        surgery.resize(
+            r"^emb$",
+            axis=0,
+            size=4,
+            init=lambda key, shape, dtype: jnp.full(shape, 7, dtype),
+            seed=0,
+        )
+    )
+    result = surgery.load(
+        source, plan, target={"emb": _sds((4, 3), jnp.float32)}
+    )
+    out = np.asarray(jax.device_get(result["emb"]))
+    np.testing.assert_array_equal(
+        out[:2], np.arange(6, dtype=np.float32).reshape(2, 3)
+    )
+    np.testing.assert_array_equal(out[2:], np.full((2, 3), 7, dtype=np.float32))
+
+
 class ShardedExecutionTest(absltest.TestCase):
 
   def _mesh(self):

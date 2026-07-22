@@ -27,6 +27,7 @@ import dataclasses
 import re
 from typing import Any
 
+import jax
 import numpy as np
 from orbax.checkpoint.experimental.v1._src.surgery import manifest as manifest_lib
 from orbax.checkpoint.experimental.v1._src.surgery import report as report_lib
@@ -721,12 +722,55 @@ def cast(pattern: str, dtype: np.typing.DTypeLike) -> Op:
   return Operation("cast", op, lambda: _recast_to_target(pattern))
 
 
+def _seeded_init(
+    jax_init: Callable[..., Any], seed: int
+) -> manifest_lib.InitFn:
+  """Wraps a jax-style initializer into a plain `(shape, dtype)` filler."""
+  rng_key = jax.random.key(seed)
+
+  def init(shape: manifest_lib.Shape, dtype: np.dtype) -> np.ndarray:
+    return np.asarray(jax_init(rng_key, shape, dtype)).astype(dtype, copy=False)
+
+  return init
+
+
+def _resize_leaf(
+    key: str,
+    v: VirtualLeaf,
+    axis: int,
+    size: int,
+    tail_init: manifest_lib.InitFn | None,
+    ctx: ResolveContext,
+) -> VirtualLeaf:
+  """Builds the truncated or grown leaf for one `resize` match."""
+  cur = v.shape[axis]
+  target_shape = v.shape[:axis] + (size,) + v.shape[axis + 1 :]
+  if size <= cur:
+    assignments = []
+    for a in v.assignments:
+      sliced = _slice_axis(a, axis, 0, size)
+      if sliced is not None:
+        assignments.append(sliced)
+    return VirtualLeaf(target_shape, v.dtype, tuple(assignments), None)
+  if tail_init is None:
+    ctx.report.add_error(
+        report_lib.UNCOVERED_TARGET,
+        key,
+        f"resize {key!r} grows axis {axis} from {cur} to {size} but no init"
+        " was given for the tail",
+    )
+  else:
+    ctx.report.filled[key] = f"resize tail [{cur}:{size}] on axis {axis}"
+  return VirtualLeaf(target_shape, v.dtype, v.assignments, tail_init)
+
+
 def resize(
     pattern: str,
     *,
     axis: int = 0,
     size: int,
-    init: manifest_lib.InitFn | None = None,
+    init: manifest_lib.InitFn | Callable[..., Any] | None = None,
+    seed: int | None = None,
 ) -> Op:
   """Truncates or grows matching leaves along `axis` to `size`.
 
@@ -738,11 +782,16 @@ def resize(
     axis: Axis to resize.
     size: New extent along `axis`.
     init: Fills the grown tail; required when `size` exceeds the current extent.
+      Without `seed` it is called as `init(shape, dtype)`; with `seed` it is a
+      jax-style initializer called as `init(key, shape, dtype)`.
+    seed: When set, `init` is a jax-style initializer and this seeds its PRNG
+      key.
 
   Returns:
     An operation that resizes matching leaves.
   """
   compiled = re.compile(pattern)
+  tail_init = init if seed is None else _seeded_init(init, seed)
 
   def op(manifest: Manifest, ctx: ResolveContext) -> Manifest:
     result: Manifest = {}
@@ -752,37 +801,9 @@ def resize(
         result[key] = leaf
         continue
       matched_any = True
-      v = manifest_lib.as_virtual(leaf)
-      cur = v.shape[axis]
-      target_shape = v.shape[:axis] + (size,) + v.shape[axis + 1 :]
-      if size <= cur:
-        assignments = []
-        for a in v.assignments:
-          sliced = _slice_axis(a, axis, 0, size)
-          if sliced is not None:
-            assignments.append(sliced)
-        result[key] = VirtualLeaf(
-            shape=target_shape,
-            dtype=v.dtype,
-            assignments=tuple(assignments),
-            init=None,
-        )
-      else:
-        if init is None:
-          ctx.report.add_error(
-              report_lib.UNCOVERED_TARGET,
-              key,
-              f"resize {key!r} grows axis {axis} from {cur} to {size} but no"
-              " init was given for the tail",
-          )
-        else:
-          ctx.report.filled[key] = f"resize tail [{cur}:{size}] on axis {axis}"
-        result[key] = VirtualLeaf(
-            shape=target_shape,
-            dtype=v.dtype,
-            assignments=v.assignments,
-            init=init,
-        )
+      result[key] = _resize_leaf(
+          key, manifest_lib.as_virtual(leaf), axis, size, tail_init, ctx
+      )
     if not matched_any:
       ctx.report.add_error(
           report_lib.UNMATCHED_RULE,
