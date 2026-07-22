@@ -52,14 +52,22 @@ def _sharding_of(spec: Any) -> jax.sharding.Sharding:
   return jax.sharding.SingleDeviceSharding(jax.devices()[0])
 
 
-def _referenced_source_keys(manifest: manifest_lib.Manifest) -> set[str]:
-  """Returns the source keys any assignment reads."""
-  keys: set[str] = set()
+def _referenced_by_namespace(
+    manifest: manifest_lib.Manifest,
+) -> dict[str, set[str]]:
+  """Returns the source keys any assignment reads, grouped by namespace."""
+  refs: dict[str, set[str]] = {}
   for leaf in manifest.values():
     for a in manifest_lib.as_virtual(leaf).assignments:
-      if a.ref.source == pipeline_lib.DEFAULT_SOURCE:
-        keys.add(a.ref.key)
-  return keys
+      refs.setdefault(a.ref.source, set()).add(a.ref.key)
+  return refs
+
+
+def _referenced_source_keys(manifest: manifest_lib.Manifest) -> set[str]:
+  """Returns the single-source keys any assignment reads."""
+  return _referenced_by_namespace(manifest).get(
+      pipeline_lib.DEFAULT_SOURCE, set()
+  )
 
 
 def read_keys(plan: pipeline_lib.Plan, source_metadata: Any) -> set[str]:
@@ -147,14 +155,41 @@ def _open_stored_reader(
   raise ValueError(f"Could not open leaf {name!r} in {leaf_dir}: {last_error}")
 
 
-def _checkpoint_sources(
-    path: Any, plan: pipeline_lib.Plan
+def _specs_from_metadata(
+    meta_flat: dict[str, Any],
+    leaf_dir: str,
+    use_ocdbt: bool,
+    referenced: set[str],
 ) -> dict[str, Any]:
-  """Builds a flat source spec for a checkpoint.
+  """Builds source specs, opening a reader only for referenced keys.
 
-  Needed leaves become `StoredArray`s that read sub-ranges from storage; the
-  rest become shape-and-dtype-only leaves that are never opened, so dropped
-  keys are never read.
+  Args:
+    meta_flat: The flat metadata view of a checkpoint.
+    leaf_dir: The checkpoint's array directory.
+    use_ocdbt: Whether the store is OCDBT.
+    referenced: The keys any assignment reads.
+
+  Returns:
+    A flat mapping of source key to spec: a `StoredArray` for referenced keys,
+    a shape-and-dtype-only leaf for the rest.
+  """
+  specs: dict[str, Any] = {}
+  for key, leaf_meta in meta_flat.items():
+    if key in referenced:
+      specs[key] = manifest_lib.StoredArray(
+          shape=tuple(leaf_meta.shape),
+          dtype=np.dtype(leaf_meta.dtype),
+          read=_open_stored_reader(leaf_dir, key, use_ocdbt),
+      )
+    else:
+      specs[key] = jax.ShapeDtypeStruct(
+          tuple(leaf_meta.shape), leaf_meta.dtype
+      )
+  return specs
+
+
+def _checkpoint_sources(path: Any, plan: pipeline_lib.Plan) -> dict[str, Any]:
+  """Builds a single-source spec for a checkpoint, reading only needed leaves.
 
   Args:
     path: The checkpoint path.
@@ -165,22 +200,60 @@ def _checkpoint_sources(
   """
   source_metadata = metadata_loading.metadata(path).metadata
   meta_flat = trees.flatten(source_metadata)
-  needed = read_keys(plan, source_metadata)
   leaf_dir, use_ocdbt = _resolve_leaf_directory(path)
+  referenced = read_keys(plan, source_metadata)
+  return _specs_from_metadata(meta_flat, leaf_dir, use_ocdbt, referenced)
 
-  combined: dict[str, Any] = {}
-  for key, leaf_meta in meta_flat.items():
-    if key in needed:
-      combined[key] = manifest_lib.StoredArray(
-          shape=tuple(leaf_meta.shape),
-          dtype=np.dtype(leaf_meta.dtype),
-          read=_open_stored_reader(leaf_dir, key, use_ocdbt),
-      )
-    else:
-      combined[key] = jax.ShapeDtypeStruct(
-          tuple(leaf_meta.shape), leaf_meta.dtype
-      )
-  return combined
+
+def _is_namespaced(sources: Any) -> bool:
+  """True if `sources` is a mapping of namespace to checkpoint path."""
+  return (
+      isinstance(sources, dict)
+      and bool(sources)
+      and all(_is_checkpoint_source(v) for v in sources.values())
+  )
+
+
+def _namespaced_checkpoint_sources(
+    sources: dict[str, Any], plan: pipeline_lib.Plan, target: Any
+) -> dict[str, dict[str, Any]]:
+  """Builds per-namespace checkpoint specs, opening only referenced leaves.
+
+  A metadata-only probe resolve determines which keys each namespace
+  contributes before any TensorStore is opened.
+
+  Args:
+    sources: A mapping from namespace to checkpoint path.
+    plan: The plan being executed.
+    target: The abstract target tree.
+
+  Returns:
+    A mapping from namespace to that namespace's flat source specs.
+  """
+  metas = {
+      ns: metadata_loading.metadata(path).metadata
+      for ns, path in sources.items()
+  }
+  meta_flats = {ns: trees.flatten(md) for ns, md in metas.items()}
+  layouts = {ns: _resolve_leaf_directory(path) for ns, path in sources.items()}
+
+  probe_specs = {
+      ns: {
+          key: jax.ShapeDtypeStruct(tuple(m.shape), m.dtype)
+          for key, m in flat.items()
+      }
+      for ns, flat in meta_flats.items()
+  }
+  probe = plan.resolve_sources(probe_specs, target)
+  referenced = _referenced_by_namespace(probe.manifest)
+
+  ns_specs: dict[str, dict[str, Any]] = {}
+  for ns, flat in meta_flats.items():
+    leaf_dir, use_ocdbt = layouts[ns]
+    ns_specs[ns] = _specs_from_metadata(
+        flat, leaf_dir, use_ocdbt, referenced.get(ns, set())
+    )
+  return ns_specs
 
 
 def execute(plan: pipeline_lib.Plan, sources: Any, target: Any) -> Any:
@@ -188,14 +261,19 @@ def execute(plan: pipeline_lib.Plan, sources: Any, target: Any) -> Any:
 
   Args:
     plan: The plan to execute.
-    sources: A checkpoint path or an in-memory tree of source arrays.
+    sources: A checkpoint path, an in-memory tree of source arrays, or a mapping
+      from namespace to checkpoint path for a multi-source merge.
     target: The abstract target tree: leaves are `jax.ShapeDtypeStruct` or
       arrays carrying a sharding.
 
   Returns:
     A tree with the structure of `target` and assembled arrays as leaves.
   """
-  if _is_checkpoint_source(sources):
+  if _is_namespaced(sources):
+    resolved = plan.resolve_sources(
+        _namespaced_checkpoint_sources(sources, plan, target), target
+    )
+  elif _is_checkpoint_source(sources):
     resolved = plan.resolve(_checkpoint_sources(sources, plan), target)
   else:
     resolved = plan.resolve(sources, target)

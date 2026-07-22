@@ -181,8 +181,40 @@ class Plan:
   ops: tuple[Op, ...]
   on_missing: str
 
+  def _resolve_refs(
+      self,
+      source_refs: dict[str, dict[str, LeafRef]],
+      initial_namespace: str | None,
+      target: Any,
+  ) -> ResolvedPlan:
+    """Folds the operations over a manifest built from source references.
+
+    Args:
+      source_refs: Per-namespace leaf references, keyed by namespace then key.
+      initial_namespace: The namespace whose references seed the manifest, or
+        `None` to start empty (a multi-source merge populated by `take`).
+      target: The abstract target tree, or `None`.
+
+    Returns:
+      The resolved manifest and its report.
+    """
+    ctx = operations_lib.ResolveContext(
+        on_missing=self.on_missing,
+        report=PlanReport(),
+        source_refs=source_refs,
+    )
+    if initial_namespace is not None:
+      manifest: Manifest = dict(source_refs[initial_namespace])
+    else:
+      manifest = {}
+    for op in self.ops:
+      manifest = op(manifest, ctx)
+    target_flat = trees.flatten(target) if target is not None else None
+    _validate(manifest, target_flat, ctx)
+    return ResolvedPlan(manifest=manifest, report=ctx.report)
+
   def resolve(self, source: Any, target: Any = None) -> ResolvedPlan:
-    """Folds the operations over a manifest built from `source`.
+    """Folds the operations over a manifest built from a single `source`.
 
     Args:
       source: A single source tree of leaves, arrays for execution or metadata
@@ -192,21 +224,34 @@ class Plan:
     Returns:
       The resolved manifest and its report.
     """
-    ctx = operations_lib.ResolveContext(
-        on_missing=self.on_missing, report=PlanReport()
-    )
-    source_flat = trees.flatten(source)
-    manifest: Manifest = {}
-    ctx.source_refs[DEFAULT_SOURCE] = {}
-    for key, spec in source_flat.items():
-      ref = _leaf_ref(DEFAULT_SOURCE, key, spec)
-      manifest[key] = ref
-      ctx.source_refs[DEFAULT_SOURCE][key] = ref
-    for op in self.ops:
-      manifest = op(manifest, ctx)
-    target_flat = trees.flatten(target) if target is not None else None
-    _validate(manifest, target_flat, ctx)
-    return ResolvedPlan(manifest=manifest, report=ctx.report)
+    refs = {
+        key: _leaf_ref(DEFAULT_SOURCE, key, spec)
+        for key, spec in trees.flatten(source).items()
+    }
+    return self._resolve_refs({DEFAULT_SOURCE: refs}, DEFAULT_SOURCE, target)
+
+  def resolve_sources(
+      self, sources: dict[str, Any], target: Any = None
+  ) -> ResolvedPlan:
+    """Folds the operations over several named sources.
+
+    The manifest starts empty; `take` imports keys from the named sources.
+
+    Args:
+      sources: A mapping from namespace to a source tree of leaves.
+      target: The abstract target tree, or `None`.
+
+    Returns:
+      The resolved manifest and its report.
+    """
+    source_refs = {
+        namespace: {
+            key: _leaf_ref(namespace, key, spec)
+            for key, spec in trees.flatten(source).items()
+        }
+        for namespace, source in sources.items()
+    }
+    return self._resolve_refs(source_refs, None, target)
 
   def preview(self, source: Any, target: Any = None) -> PlanReport:
     """Resolves the plan and returns its report without reading array data.

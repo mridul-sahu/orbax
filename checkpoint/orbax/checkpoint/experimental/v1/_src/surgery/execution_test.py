@@ -130,6 +130,47 @@ class CheckpointByteRangeTest(absltest.TestCase):
     )
 
 
+class MultiSourceMergeTest(absltest.TestCase):
+
+  def test_merge_two_checkpoints_with_fresh_fusion_leaf(self):
+    root = self.create_tempdir().full_path
+    vision = os.path.join(root, "vision")
+    text = os.path.join(root, "text")
+    ocp.save(
+        vision, {"params.enc": jnp.arange(6, dtype=jnp.float32).reshape(2, 3)}
+    )
+    ocp.save(
+        text,
+        {"params.enc": jnp.arange(6, dtype=jnp.float32).reshape(2, 3) + 10},
+    )
+
+    plan = surgery.pipeline(
+        surgery.take("vision", r"^params\.", into="params.image_encoder."),
+        surgery.take("text", r"^params\.", into="params.text_encoder."),
+        on_missing="init_from_target",
+    )
+    target = {
+        "params.image_encoder.enc": _sds((2, 3), jnp.float32),
+        "params.text_encoder.enc": _sds((2, 3), jnp.float32),
+        "params.fusion": _sds((4,), jnp.float32),
+    }
+
+    result = surgery.load({"vision": vision, "text": text}, plan, target=target)
+
+    np.testing.assert_array_equal(
+        np.asarray(jax.device_get(result["params.image_encoder.enc"])),
+        np.arange(6, dtype=np.float32).reshape(2, 3),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(jax.device_get(result["params.text_encoder.enc"])),
+        np.arange(6, dtype=np.float32).reshape(2, 3) + 10,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(jax.device_get(result["params.fusion"])),
+        np.zeros(4, dtype=np.float32),
+    )
+
+
 class ShardedExecutionTest(absltest.TestCase):
 
   def _mesh(self):
