@@ -13,3 +13,14 @@
 # limitations under the License.
 
 """Model surgery transformations."""
+
+# pylint: disable=g-importing-member, g-multiple-import, unused-import
+
+from orbax.checkpoint.experimental.model_surgery.transformations.fusing import fuse_by_keys
+from orbax.checkpoint.experimental.model_surgery.transformations.fusing import fuse_by_pattern
+from orbax.checkpoint.experimental.model_surgery.transformations.nesting import unflatten
+from orbax.checkpoint.experimental.model_surgery.transformations.renaming import rename_by_regex
+from orbax.checkpoint.experimental.model_surgery.transformations.repeating import repeat_by_keys
+from orbax.checkpoint.experimental.model_surgery.transformations.repeating import repeat_by_pattern
+from orbax.checkpoint.experimental.model_surgery.transformations.stacking import stack
+from orbax.checkpoint.experimental.model_surgery.transformations.types import Transformation
