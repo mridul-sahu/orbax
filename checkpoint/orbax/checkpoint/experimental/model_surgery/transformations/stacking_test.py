@@ -20,7 +20,6 @@ import jax.numpy as jnp
 import numpy as np
 from orbax.checkpoint.experimental.model_surgery.transformations import stacking
 
-
 Mesh = jax.sharding.Mesh
 NamedSharding = jax.sharding.NamedSharding
 PartitionSpec = jax.sharding.PartitionSpec
@@ -173,6 +172,15 @@ class StackingTest(absltest.TestCase):
         r'Stacking "layers\.q_proj": Found keys \[0, 2\], but expected indices'
         r" 0\.\.2 when padding is disabled",
     ):
+      transform(params)
+
+  def test_stack_mixed_numpy_and_jax_raises(self):
+    params = {
+        "layers.0.q_proj": np.array([1]),
+        "layers.1.q_proj": jnp.array([2]),
+    }
+    transform = stacking.stack(pattern=r"layers\.(\d+\.)")
+    with self.assertRaisesRegex(ValueError, "mixes numpy and jax"):
       transform(params)
 
   def test_stack_inplace(self):

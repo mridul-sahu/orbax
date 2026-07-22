@@ -15,15 +15,14 @@
 """Stacking utilities for model surgery."""
 
 import collections
+from collections.abc import Callable, Mapping, Sequence
 import re
-from typing import Callable, Mapping, Sequence
 
 from absl import logging
 import jax
 import jax.numpy as jnp
 import numpy as np
 from orbax.checkpoint.experimental.model_surgery.transformations import types
-
 
 Transformation = types.Transformation
 
@@ -65,12 +64,9 @@ def _streaming_stack(
     stacked_chunk = jnp.stack(chunk_list, axis=axis)
     return stacked_chunk
 
-  return jax.make_array_from_callback(tuple(final_shape), sharding, _callback)  # pyrefly: ignore[bad-argument-type]
-
-
-def _is_host_array(x) -> bool:
-  """True if x is a jax.Array on CPU."""
-  return isinstance(x, jax.Array) and next(iter(x.devices())).platform == "cpu"
+  return jax.make_array_from_callback(  # pyrefly: ignore[bad-argument-type]
+      tuple(final_shape), sharding, _callback
+  )
 
 
 def _select_stack_fn(
@@ -79,10 +75,13 @@ def _select_stack_fn(
 ) -> Callable[[Sequence[jax.Array | np.ndarray], int], jax.Array | np.ndarray]:
   """Selects the stack function based on the input array sharding.
 
-  * If any of the `items` is a numpy array, use np.stack.
+  * If all the `items` are numpy arrays, use np.stack.
   * If a sharding is specified and all the `items` are jax arrays that live in
     host memory, use _streaming_stack.
   * Otherwise, use jnp.stack.
+
+  A group that mixes numpy and jax arrays is an error rather than a silent
+  `np.stack`, which would pull the jax arrays to host.
 
   Args:
     items: Sequence of arrays to stack.
@@ -91,14 +90,25 @@ def _select_stack_fn(
   Returns:
     The stack function to use for the given items.
   """
-  if any(isinstance(x, np.ndarray) for x in items):
+  has_numpy = any(isinstance(x, np.ndarray) for x in items)
+  has_jax = any(isinstance(x, jax.Array) for x in items)
+  if has_numpy and has_jax:
+    raise ValueError(
+        "Cannot stack a group that mixes numpy and jax arrays; convert the"
+        " inputs to a single array type first."
+    )
+  if has_numpy:
     return np.stack
-  if sharding is not None and all(_is_host_array(x) for x in items):
-    return lambda items, axis: _streaming_stack(items, axis, sharding)  # pyrefly: ignore[bad-argument-type]
+  if sharding is not None and all(types.is_host_array(x) for x in items):
+    # pylint: disable=line-too-long
+    return lambda items, axis: _streaming_stack(  # pyrefly: ignore[bad-argument-type]
+        items, axis, sharding
+    )
+    # pylint: enable=line-too-long
   return jnp.stack
 
 
-def stack(
+def stack(  # pylint: disable=too-complex
     pattern: str,
     *,
     expected_count: int | None = None,
@@ -188,16 +198,18 @@ def stack(
 
       idx_str = match.group(1)
       idx_matches = re.findall(r"\d+", idx_str)
-      assert len(idx_matches) == 1, (
-          "Capture group must contain exactly one single positive integer, "
-          f"got {idx_str}."
-      )
+      if len(idx_matches) != 1:
+        raise ValueError(
+            f'Stacking key "{key}": capture group must contain exactly one'
+            f' positive integer, got "{idx_str}".'
+        )
       idx = int(idx_matches[0])
       # Remove group 1 of pattern from the key to get the base key.
       base_key = key[: match.start(1)] + key[match.end(1) :]
-      assert (
-          idx not in groups[base_key]
-      ), f"Duplicate index {idx} found for base_key {base_key}"
+      if idx in groups[base_key]:
+        raise ValueError(
+            f'Stacking "{base_key}": duplicate index {idx} from key "{key}".'
+        )
       groups[base_key][idx] = value
 
       if inplace:
@@ -212,7 +224,6 @@ def stack(
     # Determine types and stack function (use NumPy if inputs are NumPy)
     rep_val = next(iter(next(iter(groups.values())).values()))
     is_numpy = isinstance(rep_val, np.ndarray)
-    ones_fn = np.ones if is_numpy else jnp.ones
 
     # Determine expected_count if not provided
     local_expected_count = expected_count
@@ -262,14 +273,15 @@ def stack(
         shape.insert(axis, local_expected_count)
         dtype = rep_val.dtype
 
-        # Initialize stacked array
-        stacked = (ones_fn(shape, dtype=dtype) * filler_val).astype(dtype)
         if len(idx_dict) > local_expected_count:
           raise ValueError(
               f"Found {len(idx_dict)} items, but expected maximum"
               f" {local_expected_count} for {base_key}"
           )
-        # Fill in values
+        # Assemble the padded array once on host: a single numpy buffer filled
+        # with the filler, each present slice written in place, then one
+        # transfer. This avoids copying the whole stack per index.
+        buffer = np.full(shape, filler_val, dtype=dtype)
         for idx, val in idx_dict.items():
           if idx >= local_expected_count:
             logging.warning(
@@ -282,10 +294,7 @@ def stack(
             continue
           slices = [slice(None)] * len(shape)
           slices[axis] = idx
-          if is_numpy:
-            stacked[tuple(slices)] = val
-          else:
-            stacked = stacked.at[tuple(slices)].set(val)  # pyrefly: ignore[missing-attribute]
+          buffer[tuple(slices)] = np.asarray(val)
 
         if len(idx_dict) != local_expected_count:
           logging.warning(
@@ -296,8 +305,12 @@ def stack(
               filler_val,
           )
 
-        if target_sharding is not None:
-          stacked = jax.device_put(stacked, target_sharding)
+        if is_numpy:
+          stacked = buffer
+        elif target_sharding is not None:
+          stacked = jax.device_put(buffer, target_sharding)
+        else:
+          stacked = jnp.asarray(buffer)
 
       result[base_key] = stacked
 
