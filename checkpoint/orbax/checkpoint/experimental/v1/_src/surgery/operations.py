@@ -25,6 +25,7 @@ import collections
 from collections.abc import Callable, Sequence
 import dataclasses
 import re
+from typing import Any
 
 import numpy as np
 from orbax.checkpoint.experimental.v1._src.surgery import manifest as manifest_lib
@@ -55,9 +56,33 @@ class ResolveContext:
   source_refs: dict[str, dict[str, LeafRef]] = dataclasses.field(
       default_factory=dict
   )
+  target: dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
-Op = Callable[[Manifest, ResolveContext], Manifest]
+_Apply = Callable[[Manifest, ResolveContext], Manifest]
+_MakeInverse = Callable[[], "Operation"]
+
+
+@dataclasses.dataclass(frozen=True)
+class Operation:
+  """A manifest rewrite plus how to undo it.
+
+  Attributes:
+    name: The operation name, used in messages.
+    apply: The manifest rewrite.
+    make_inverse: Builds the inverse operation, or a string reason when the
+      operation is not invertible.
+  """
+
+  name: str
+  apply: _Apply
+  make_inverse: _MakeInverse | str
+
+  def __call__(self, manifest: Manifest, ctx: ResolveContext) -> Manifest:
+    return self.apply(manifest, ctx)
+
+
+Op = Operation
 
 
 def _const_init(value: float) -> manifest_lib.InitFn:
@@ -116,7 +141,13 @@ def rename(*rules: tuple[str, str]) -> Op:
         )
     return result
 
-  return op
+  inverse_rules = _invert_rename_rules(rules)
+  make_inverse = (
+      (lambda: rename(*inverse_rules))
+      if inverse_rules is not None
+      else "rename rules are not invertible literals"
+  )
+  return Operation("rename", op, make_inverse)
 
 
 def drop(pattern: str) -> Op:
@@ -139,7 +170,9 @@ def drop(pattern: str) -> Op:
         result[key] = leaf
     return result
 
-  return op
+  return Operation(
+      "drop", op, "drop discards information and cannot be inverted"
+  )
 
 
 def select(pattern: str) -> Op:
@@ -170,7 +203,9 @@ def select(pattern: str) -> Op:
       )
     return result
 
-  return op
+  return Operation(
+      "select", op, "select discards information and cannot be inverted"
+  )
 
 
 def _build_stack(
@@ -300,7 +335,7 @@ def stack(
       result[base] = _build_stack(base, groups[base], axis, filler, ctx)
     return result
 
-  return op
+  return Operation("stack", op, lambda: _unstack_restoring(pattern, axis))
 
 
 def unstack(pattern: str, *, axis: int = 0, sep: str = ".") -> Op:
@@ -351,7 +386,9 @@ def unstack(pattern: str, *, axis: int = 0, sep: str = ".") -> Op:
       )
     return result
 
-  return op
+  return Operation(
+      "unstack", op, lambda: stack(f"({re.escape(sep)}\\d+)$", axis=axis)
+  )
 
 
 def _unstack_slice(
@@ -475,7 +512,7 @@ def fuse(*, parts: Sequence[str], into: str, axis: int = 0) -> Op:
       )
     return result
 
-  return op
+  return Operation("fuse", op, lambda: _split_parts(into, parts, axis))
 
 
 def split(
@@ -537,7 +574,28 @@ def split(
       offset += size
     return result
 
-  return op
+  return Operation("split", op, lambda: _fuse_exact(into, key, axis))
+
+
+def _source_axis_for_target(a: Assignment, target_axis: int) -> int:
+  """Maps a target axis to the source axis it reads from.
+
+  When an assignment slices a source axis (an unstack) or inserts a target axis
+  (a stack), the source and target axes differ by one; this accounts for that so
+  a later slice touches the right source axis.
+
+  Args:
+    a: The assignment.
+    target_axis: An axis in the target frame.
+
+  Returns:
+    The corresponding axis in the source frame.
+  """
+  if a.sliced_source_axis is not None and target_axis >= a.sliced_source_axis:
+    return target_axis + 1
+  if a.inserted_axis is not None and target_axis > a.inserted_axis:
+    return target_axis - 1
+  return target_axis
 
 
 def _slice_axis(
@@ -552,11 +610,16 @@ def _slice_axis(
   t_start = tr.start[:axis] + (new_lo - lo,) + tr.start[axis + 1 :]
   t_stop = tr.stop[:axis] + (new_hi - lo,) + tr.stop[axis + 1 :]
   sr = a.source_region
+  s_axis = _source_axis_for_target(a, axis)
   shift = new_lo - tr.start[axis]
   extent = new_hi - new_lo
-  s_start = sr.start[:axis] + (sr.start[axis] + shift,) + sr.start[axis + 1 :]
+  s_start = (
+      sr.start[:s_axis] + (sr.start[s_axis] + shift,) + sr.start[s_axis + 1 :]
+  )
   s_stop = (
-      sr.start[:axis] + (sr.start[axis] + shift + extent,) + sr.stop[axis + 1 :]
+      sr.start[:s_axis]
+      + (sr.start[s_axis] + shift + extent,)
+      + sr.stop[s_axis + 1 :]
   )
   return dataclasses.replace(
       a,
@@ -610,7 +673,9 @@ def repeat(pattern: str, *, axis: int = 0, times: int) -> Op:
       )
     return result
 
-  return op
+  return Operation(
+      "repeat", op, lambda: _take_first_block(pattern, axis, times)
+  )
 
 
 def cast(pattern: str, dtype: np.typing.DTypeLike) -> Op:
@@ -652,7 +717,7 @@ def cast(pattern: str, dtype: np.typing.DTypeLike) -> Op:
       )
     return result
 
-  return op
+  return Operation("cast", op, lambda: _recast_to_target(pattern))
 
 
 def resize(
@@ -725,7 +790,11 @@ def resize(
       )
     return result
 
-  return op
+  return Operation(
+      "resize",
+      op,
+      "resize needs the pre-resize size to invert and is not invertible here",
+  )
 
 
 def take(source: str, pattern: str, *, into: str) -> Op:
@@ -767,4 +836,258 @@ def take(source: str, pattern: str, *, into: str) -> Op:
       )
     return result
 
-  return op
+  return Operation(
+      "take",
+      op,
+      "take across namespaces cannot be inverted on a single-tree export",
+  )
+
+
+def _unescape_literal(regex_text: str) -> str | None:
+  """Returns the plain text of an escaped-literal regex, or None if it can't."""
+  out = []
+  i = 0
+  while i < len(regex_text):
+    c = regex_text[i]
+    if c == "\\":
+      if i + 1 >= len(regex_text):
+        return None
+      out.append(regex_text[i + 1])
+      i += 2
+    elif c in ".^$*+?{}[]()|":
+      return None
+    else:
+      out.append(c)
+      i += 1
+  return "".join(out)
+
+
+def _parse_stack_pattern(pattern: str) -> tuple[str, str] | None:
+  """Splits a stack pattern into its literal prefix and index suffix.
+
+  Recognizes the form `<literal>(\\d+<literal>)` with the group at the end, the
+  shape a key-restoring unstack can reconstruct from.
+
+  Args:
+    pattern: The stack pattern.
+
+  Returns:
+    The literal prefix and the literal that follows the index, or `None` when
+    the pattern is not of the recognized form.
+  """
+  open_i = pattern.find("(")
+  close_i = pattern.find(")", open_i)
+  if open_i < 0 or close_i < 0 or pattern[close_i + 1 :]:
+    return None
+  group = pattern[open_i + 1 : close_i]
+  if not group.startswith(r"\d+"):
+    return None
+  prefix = _unescape_literal(pattern[:open_i])
+  suffix = _unescape_literal(group[3:])
+  if prefix is None or suffix is None:
+    return None
+  return prefix, suffix
+
+
+def _unstack_restoring(pattern: str, axis: int) -> "Operation":
+  """The inverse of stack: restores each stacked leaf back into its keys."""
+  parsed = _parse_stack_pattern(pattern)
+
+  def op(manifest: Manifest, ctx: ResolveContext) -> Manifest:
+    if parsed is None:
+      ctx.report.add_error(
+          report_lib.UNMATCHED_RULE,
+          pattern,
+          f"cannot invert stack pattern {pattern!r}",
+      )
+      return manifest
+    prefix, suffix = parsed
+    insert_at = len(prefix)
+    result: Manifest = {}
+    for key, leaf in manifest.items():
+      if not key.startswith(prefix):
+        result[key] = leaf
+        continue
+      v = manifest_lib.as_virtual(leaf)
+      sub_shape = v.shape[:axis] + v.shape[axis + 1 :]
+      for i in range(v.shape[axis]):
+        original = key[:insert_at] + f"{i}{suffix}" + key[insert_at:]
+        assignments = []
+        for a in v.assignments:
+          sliced = _unstack_slice(a, axis, i, key, ctx)
+          if sliced is not None:
+            assignments.append(sliced)
+        result[original] = VirtualLeaf(
+            shape=sub_shape,
+            dtype=v.dtype,
+            assignments=tuple(assignments),
+            init=None,
+        )
+    return result
+
+  return Operation("unstack", op, lambda: stack(pattern, axis=axis))
+
+
+def _split_parts(into: str, parts: Sequence[str], axis: int) -> "Operation":
+  """The inverse of fuse: splits each fused leaf into equal-size parts."""
+  parts = tuple(parts)
+
+  def op(manifest: Manifest, ctx: ResolveContext) -> Manifest:
+    result: Manifest = {}
+    for key, leaf in manifest.items():
+      if into not in key:
+        result[key] = leaf
+        continue
+      v = manifest_lib.as_virtual(leaf)
+      total = v.shape[axis]
+      if total % len(parts) != 0:
+        ctx.report.add_error(
+            report_lib.SHAPE_MISMATCH,
+            key,
+            f"cannot split {key!r} of size {total} into {len(parts)} equal"
+            " parts; unequal fuse needs recorded offsets to invert",
+        )
+        result[key] = leaf
+        continue
+      chunk = total // len(parts)
+      base = key.replace(into, "\x00", 1)
+      sub_shape = v.shape[:axis] + (chunk,) + v.shape[axis + 1 :]
+      offset = 0
+      for p in parts:
+        assignments = []
+        for a in v.assignments:
+          sliced = _slice_axis(a, axis, offset, offset + chunk)
+          if sliced is not None:
+            assignments.append(sliced)
+        result[base.replace("\x00", p)] = VirtualLeaf(
+            shape=sub_shape,
+            dtype=v.dtype,
+            assignments=tuple(assignments),
+            init=None,
+        )
+        offset += chunk
+    return result
+
+  return Operation(
+      "split", op, lambda: fuse(parts=parts, into=into, axis=axis)
+  )
+
+
+def _fuse_exact(sources: Sequence[str], target: str, axis: int) -> "Operation":
+  """The inverse of `split`: concatenates the split leaves back into one."""
+  sources = tuple(sources)
+
+  def op(manifest: Manifest, ctx: ResolveContext) -> Manifest:
+    missing = [s for s in sources if s not in manifest]
+    if missing:
+      ctx.report.add_error(
+          report_lib.MISSING_SOURCE,
+          target,
+          f"fuse of {target!r} is missing {missing}",
+      )
+      return manifest
+    result: Manifest = {k: v for k, v in manifest.items() if k not in sources}
+    ref_shape: list[int] | None = None
+    dtype = None
+    offset = 0
+    assignments: list[Assignment] = []
+    for s in sources:
+      v = manifest_lib.as_virtual(manifest[s])
+      if ref_shape is None:
+        ref_shape = list(v.shape)
+        dtype = v.dtype
+      for a in v.assignments:
+        assignments.append(_shift_target(a, axis, offset))
+      offset += v.shape[axis]
+    target_shape = (
+        tuple(ref_shape[:axis]) + (offset,) + tuple(ref_shape[axis + 1 :])
+    )
+    result[target] = VirtualLeaf(
+        shape=target_shape,
+        dtype=dtype,
+        assignments=tuple(assignments),
+        init=None,
+    )
+    return result
+
+  return Operation(
+      "fuse", op, "fuse of split parts needs recorded sizes to invert"
+  )
+
+
+def _take_first_block(pattern: str, axis: int, times: int) -> "Operation":
+  """The inverse of `repeat`: keeps the first tile along `axis`."""
+  compiled = re.compile(pattern)
+
+  # pylint: disable=unused-argument
+  def op(manifest: Manifest, ctx: ResolveContext) -> Manifest:
+    result: Manifest = {}
+    for key, leaf in manifest.items():
+      if not compiled.search(key):
+        result[key] = leaf
+        continue
+      v = manifest_lib.as_virtual(leaf)
+      block = v.shape[axis] // times
+      sub_shape = v.shape[:axis] + (block,) + v.shape[axis + 1 :]
+      assignments = []
+      for a in v.assignments:
+        sliced = _slice_axis(a, axis, 0, block)
+        if sliced is not None:
+          assignments.append(sliced)
+      result[key] = VirtualLeaf(
+          shape=sub_shape,
+          dtype=v.dtype,
+          assignments=tuple(assignments),
+          init=None,
+      )
+    return result
+
+  return Operation(
+      "repeat", op, lambda: repeat(pattern, axis=axis, times=times)
+  )
+
+
+def _recast_to_target(pattern: str) -> "Operation":
+  """The inverse of cast: restores each matched leaf's dtype from the target."""
+  compiled = re.compile(pattern)
+
+  def op(manifest: Manifest, ctx: ResolveContext) -> Manifest:
+    result: Manifest = {}
+    for key, leaf in manifest.items():
+      if not compiled.search(key) or key not in ctx.target:
+        result[key] = leaf
+        continue
+      target_dtype = np.dtype(ctx.target[key].dtype)
+      v = manifest_lib.as_virtual(leaf)
+      new_assignments = tuple(
+          dataclasses.replace(a, cast=target_dtype) for a in v.assignments
+      )
+      result[key] = VirtualLeaf(
+          shape=v.shape,
+          dtype=target_dtype,
+          assignments=new_assignments,
+          init=v.init,
+      )
+      ctx.report.filled[key] = f"cast (lossy): dtype restored to {target_dtype}"
+    return result
+
+  return Operation("cast", op, lambda: _recast_to_target(pattern))
+
+
+def _invert_rename_rules(
+    rules: Sequence[tuple[str, str]],
+) -> list[tuple[str, str]] | None:
+  """Returns the reversed inverted rename rules, or None if not bijective."""
+  inverted: list[tuple[str, str]] = []
+  for pattern, replacement in reversed(list(rules)):
+    if replacement == "" and pattern.startswith("^"):
+      literal = _unescape_literal(pattern[1:])
+      if literal is None:
+        return None
+      inverted.append(("^", literal))
+    else:
+      literal_pattern = _unescape_literal(pattern)
+      if literal_pattern is None or replacement == "":
+        return None
+      inverted.append((re.escape(replacement), literal_pattern))
+  return inverted

@@ -198,10 +198,12 @@ class Plan:
     Returns:
       The resolved manifest and its report.
     """
+    target_flat = trees.flatten(target) if target is not None else None
     ctx = operations_lib.ResolveContext(
         on_missing=self.on_missing,
         report=PlanReport(),
         source_refs=source_refs,
+        target=target_flat or {},
     )
     if initial_namespace is not None:
       manifest: Manifest = dict(source_refs[initial_namespace])
@@ -209,9 +211,27 @@ class Plan:
       manifest = {}
     for op in self.ops:
       manifest = op(manifest, ctx)
-    target_flat = trees.flatten(target) if target is not None else None
     _validate(manifest, target_flat, ctx)
     return ResolvedPlan(manifest=manifest, report=ctx.report)
+
+  def inverse(self) -> "Plan":
+    """Returns a plan that undoes this one, for the export direction.
+
+    Returns:
+      A plan whose operations are the inverses of this plan's, in reverse
+      order.
+
+    Raises:
+      SurgeryError: If any operation is not invertible.
+    """
+    inverted = []
+    for op in reversed(self.ops):
+      if isinstance(op.make_inverse, str):
+        raise report_lib.SurgeryError(
+            f"operation {op.name!r} is not invertible: {op.make_inverse}"
+        )
+      inverted.append(op.make_inverse())
+    return Plan(ops=tuple(inverted), on_missing=self.on_missing)
 
   def resolve(self, source: Any, target: Any = None) -> ResolvedPlan:
     """Folds the operations over a manifest built from a single `source`.
