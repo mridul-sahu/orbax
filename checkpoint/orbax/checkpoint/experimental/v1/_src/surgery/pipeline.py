@@ -45,16 +45,19 @@ DEFAULT_SOURCE = "source"
 def _make_read(spec: Any) -> manifest_lib.ReadFn | None:
   """Returns a sub-range reader for `spec`, or `None` for a metadata leaf.
 
-  A real array is brought to host once and sliced per read. Byte-range reads
-  straight from storage are a later milestone; here a needed source is
-  materialized on host before its slices are placed.
+  A `StoredArray` reads each requested sub-range straight from storage. An
+  in-memory array is brought to host once and sliced per read. A metadata or
+  abstract leaf carries no data and returns `None`.
 
   Args:
-    spec: A source leaf: an array, an abstract leaf, or a metadata object.
+    spec: A source leaf: a `StoredArray`, an array, an abstract leaf, or a
+      metadata object.
 
   Returns:
     A reader, or `None` when `spec` carries no array data.
   """
+  if isinstance(spec, manifest_lib.StoredArray):
+    return spec.read
   if isinstance(spec, (np.ndarray, jax.Array)):
     host = np.asarray(spec)
     return lambda region, host=host: host[region.slices]

@@ -16,34 +16,33 @@
 
 Execution inverts the usual direction of control: each device shard of each
 target array asks which source regions fall inside it, reads exactly those, and
-places them where they belong. A key the plan drops is never read, because the
-abstract tree handed to the v1 loader marks it with `PLACEHOLDER`.
+places them where they belong. A checkpoint-backed source opens a TensorStore
+per needed leaf and reads only the requested sub-ranges; a key the plan drops is
+never opened, so its bytes are never read.
 """
 
 import os
 from typing import Any
 
+from etils import epath
 import jax
 import numpy as np
-from orbax.checkpoint.experimental.v1._src.loading import loading as loading_lib
+from orbax.checkpoint._src.serialization import tensorstore_utils as ts_utils
 from orbax.checkpoint.experimental.v1._src.metadata import loading as metadata_loading
-from orbax.checkpoint.experimental.v1._src.serialization import types as serialization_types
 from orbax.checkpoint.experimental.v1._src.surgery import manifest as manifest_lib
 from orbax.checkpoint.experimental.v1._src.surgery import pipeline as pipeline_lib
 from orbax.checkpoint.experimental.v1._src.surgery import trees
+import tensorstore as ts
 
 Region = manifest_lib.Region
 VirtualLeaf = manifest_lib.VirtualLeaf
 
+# Standard v1 pytree checkpointable subdirectory names, in resolution order.
+_CHECKPOINTABLE_NAMES = ("pytree", "state")
+
 
 def _is_checkpoint_source(source: Any) -> bool:
   return isinstance(source, (str, os.PathLike))
-
-
-def _replicated_sharding() -> jax.sharding.Sharding:
-  devices = jax.devices()
-  mesh = jax.sharding.Mesh(np.asarray(devices), ("_surgery",))
-  return jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
 
 def _sharding_of(spec: Any) -> jax.sharding.Sharding:
@@ -80,41 +79,108 @@ def read_keys(plan: pipeline_lib.Plan, source_metadata: Any) -> set[str]:
   return _referenced_source_keys(resolved.manifest)
 
 
-def _load_checkpoint_sources(
-    path: Any,
-    source_metadata: Any,
-    meta_flat: dict[str, Any],
-    needed: set[str],
-) -> dict[str, Any]:
-  """Loads only the source leaves a plan needs, via the v1 loader.
+def _resolve_leaf_directory(path: Any) -> tuple[str, bool]:
+  """Finds the array directory of a pytree checkpoint and its OCDBT flag.
 
-  Keys outside `needed` are marked with `PLACEHOLDER` in the abstract tree, so
-  the loader never reads them.
+  The arrays live in the checkpointable subdirectory that holds a `_METADATA`
+  file. OCDBT is inferred from the presence of a `manifest.ocdbt` file there.
 
   Args:
     path: The checkpoint path.
-    source_metadata: The checkpoint's metadata tree.
-    meta_flat: The flat view of `source_metadata`.
-    needed: The dotted keys the plan will read.
 
   Returns:
-    A flat mapping of source key to the value the loader returned.
+    The array directory as a posix string, and whether it is an OCDBT store.
   """
-  replicated = _replicated_sharding()
-  abstract_flat: dict[str, Any] = {}
+  base = epath.Path(path)
+  if (base / "_METADATA").exists():
+    leaf_dir = base
+  else:
+    candidates = [
+        d for d in base.iterdir() if (d / "_METADATA").exists()
+    ]
+    if not candidates:
+      raise ValueError(f"No pytree checkpointable found under {path}.")
+    by_name = {d.name: d for d in candidates}
+    leaf_dir = next(
+        (by_name[n] for n in _CHECKPOINTABLE_NAMES if n in by_name),
+        sorted(candidates, key=lambda d: d.name)[0],
+    )
+  use_ocdbt = (leaf_dir / "manifest.ocdbt").exists()
+  return leaf_dir.as_posix(), use_ocdbt
+
+
+def _open_stored_reader(
+    leaf_dir: str, name: str, use_ocdbt: bool
+) -> manifest_lib.ReadFn:
+  """Opens a TensorStore for one leaf and returns a sub-range reader.
+
+  The zarr version is not recorded separately, so v3 is tried first and v2 is
+  the fallback. Opening reads only the array metadata, not its data.
+
+  Args:
+    leaf_dir: The array directory.
+    name: The on-disk parameter name (the dotted key).
+    use_ocdbt: Whether the store is OCDBT.
+
+  Returns:
+    A function reading a region of the leaf from storage.
+  """
+  last_error: Exception | None = None
+  for use_zarr3 in (True, False):
+    spec = ts_utils.ArrayReadSpec(
+        leaf_dir, name, use_zarr3, use_ocdbt=use_ocdbt
+    ).json
+    try:
+      store = ts.open(
+          ts.Spec(spec),
+          open=True,
+          context=ts_utils.get_ts_context(use_ocdbt=use_ocdbt),
+      ).result()
+    except ValueError as e:
+      last_error = e
+      continue
+
+    def read(region: Region, store=store) -> np.ndarray:
+      return np.asarray(store[region.slices].read().result())
+
+    return read
+  raise ValueError(f"Could not open leaf {name!r} in {leaf_dir}: {last_error}")
+
+
+def _checkpoint_sources(
+    path: Any, plan: pipeline_lib.Plan
+) -> dict[str, Any]:
+  """Builds a flat source spec for a checkpoint.
+
+  Needed leaves become `StoredArray`s that read sub-ranges from storage; the
+  rest become shape-and-dtype-only leaves that are never opened, so dropped
+  keys are never read.
+
+  Args:
+    path: The checkpoint path.
+    plan: The plan being executed.
+
+  Returns:
+    A flat mapping of source key to spec.
+  """
+  source_metadata = metadata_loading.metadata(path).metadata
+  meta_flat = trees.flatten(source_metadata)
+  needed = read_keys(plan, source_metadata)
+  leaf_dir, use_ocdbt = _resolve_leaf_directory(path)
+
+  combined: dict[str, Any] = {}
   for key, leaf_meta in meta_flat.items():
     if key in needed:
-      abstract_flat[key] = jax.ShapeDtypeStruct(
-          tuple(leaf_meta.shape),
-          leaf_meta.dtype,
-          sharding=replicated,
+      combined[key] = manifest_lib.StoredArray(
+          shape=tuple(leaf_meta.shape),
+          dtype=np.dtype(leaf_meta.dtype),
+          read=_open_stored_reader(leaf_dir, key, use_ocdbt),
       )
     else:
-      abstract_flat[key] = loading_lib.PLACEHOLDER
-  abstract_tree = trees.unflatten_like(source_metadata, abstract_flat)
-
-  loaded = loading_lib.load(path, abstract_tree)
-  return trees.flatten(loaded)
+      combined[key] = jax.ShapeDtypeStruct(
+          tuple(leaf_meta.shape), leaf_meta.dtype
+      )
+  return combined
 
 
 def execute(plan: pipeline_lib.Plan, sources: Any, target: Any) -> Any:
@@ -130,25 +196,7 @@ def execute(plan: pipeline_lib.Plan, sources: Any, target: Any) -> Any:
     A tree with the structure of `target` and assembled arrays as leaves.
   """
   if _is_checkpoint_source(sources):
-    source_metadata = metadata_loading.metadata(sources).metadata
-    meta_flat = trees.flatten(source_metadata)
-    needed = read_keys(plan, source_metadata)
-    loaded_flat = _load_checkpoint_sources(
-        sources, source_metadata, meta_flat, needed
-    )
-    # A full-key-set source keeps ops seeing the same keys a preview did; only
-    # needed keys carry array data, the rest are shape-and-dtype-only leaves.
-    combined: dict[str, Any] = {}
-    for key, leaf_meta in meta_flat.items():
-      if key in needed and not serialization_types.is_placeholder(
-          loaded_flat[key]
-      ):
-        combined[key] = loaded_flat[key]
-      else:
-        combined[key] = jax.ShapeDtypeStruct(
-            tuple(leaf_meta.shape), leaf_meta.dtype
-        )
-    resolved = plan.resolve(combined, target)
+    resolved = plan.resolve(_checkpoint_sources(sources, plan), target)
   else:
     resolved = plan.resolve(sources, target)
 

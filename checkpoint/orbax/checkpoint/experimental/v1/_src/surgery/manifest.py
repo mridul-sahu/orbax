@@ -198,6 +198,24 @@ Leaf = LeafRef | VirtualLeaf
 Manifest = dict[str, Leaf]
 
 
+@dataclasses.dataclass(frozen=True)
+class StoredArray:
+  """A source array on storage whose sub-ranges are read on demand.
+
+  Used as a source spec so a checkpoint-backed leaf reads only the regions a
+  plan places, never the whole array.
+
+  Attributes:
+    shape: The array shape.
+    dtype: The array dtype.
+    read: Reads any sub-range from storage.
+  """
+
+  shape: Shape
+  dtype: np.dtype
+  read: ReadFn
+
+
 def as_virtual(leaf: Leaf) -> VirtualLeaf:
   """Views any leaf as a `VirtualLeaf`.
 

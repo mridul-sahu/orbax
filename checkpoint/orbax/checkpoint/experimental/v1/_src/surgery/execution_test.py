@@ -93,6 +93,43 @@ class CheckpointExecutionTest(absltest.TestCase):
     )
 
 
+class CheckpointByteRangeTest(absltest.TestCase):
+
+  def test_truncation_reads_only_the_kept_rows(self):
+    directory = os.path.join(self.create_tempdir().full_path, "ckpt")
+    ocp.save(directory, {"emb": jnp.arange(40, dtype=jnp.int32).reshape(10, 4)})
+
+    plan = surgery.pipeline(surgery.resize(r"^emb$", axis=0, size=4))
+    target = {"emb": _sds((4, 4), jnp.int32)}
+    result = surgery.load(directory, plan, target=target)
+
+    np.testing.assert_array_equal(
+        np.asarray(jax.device_get(result["emb"])),
+        np.arange(40).reshape(10, 4)[:4],
+    )
+
+  def test_per_shard_reads_disjoint_regions(self):
+    directory = os.path.join(self.create_tempdir().full_path, "ckpt")
+    ocp.save(directory, {"w": jnp.arange(12, dtype=jnp.float32).reshape(4, 3)})
+
+    devices = jax.devices()
+    if len(devices) >= 2:
+      mesh, spec = Mesh(np.asarray(devices[:2]), ("x",)), PartitionSpec("x")
+    else:
+      mesh, spec = Mesh(np.asarray(devices), ("x",)), PartitionSpec()
+    sharding = NamedSharding(mesh, spec)
+
+    plan = surgery.pipeline()
+    target = {"w": _sds((4, 3), jnp.float32, sharding=sharding)}
+    result = surgery.load(directory, plan, target=target)
+
+    self.assertEqual(result["w"].sharding, sharding)
+    np.testing.assert_array_equal(
+        np.asarray(jax.device_get(result["w"])),
+        np.arange(12, dtype=np.float32).reshape(4, 3),
+    )
+
+
 class ShardedExecutionTest(absltest.TestCase):
 
   def _mesh(self):
