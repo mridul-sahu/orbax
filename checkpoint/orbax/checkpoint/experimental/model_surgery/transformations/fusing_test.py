@@ -22,7 +22,7 @@ from orbax.checkpoint.experimental.model_surgery.transformations import fusing
 
 class FusingTest(absltest.TestCase):
 
-  def test_fuse_by_pattern_not_enough_keys(self):
+  def test_fuse_by_pattern_not_enough_keys_raises(self):
     params = {
         "layers.0.gate_proj.weight": jnp.array([[1, 2]]),
         "other.param": jnp.array([5]),
@@ -32,7 +32,22 @@ class FusingTest(absltest.TestCase):
         unique_parts=["gate_proj", "up_proj"],
         fused_unique_part="gate_up_proj",
     )
-    result = transform(params)
+    with self.assertRaisesRegex(ValueError, "Could not fuse"):
+      transform(params)
+
+  def test_fuse_by_pattern_not_enough_keys_warn(self):
+    params = {
+        "layers.0.gate_proj.weight": jnp.array([[1, 2]]),
+        "other.param": jnp.array([5]),
+    }
+    transform = fusing.fuse_by_pattern(
+        pattern=r"^(layers\.\d+)\.(gate_proj|up_proj)\.weight$",
+        unique_parts=["gate_proj", "up_proj"],
+        fused_unique_part="gate_up_proj",
+        on_missing="warn",
+    )
+    with self.assertLogs(level="WARNING"):
+      result = transform(params)
 
     self.assertNotIn("layers.0.gate_up_proj.weight", result)
     self.assertIn("layers.0.gate_proj.weight", result)
@@ -79,12 +94,24 @@ class FusingTest(absltest.TestCase):
         result["fused.layer0.weight"], jnp.array([[1, 2], [3, 4]])
     )
 
-  def test_fuse_by_keys_missing_keys(self):
+  def test_fuse_by_keys_missing_keys_raises(self):
     params = {
         "a": jnp.array([1]),
         "c": jnp.array([3]),
     }
     transform = fusing.fuse_by_keys(source_keys=["a", "b"], target_key="ab")
+
+    with self.assertRaisesRegex(ValueError, "Could not fuse"):
+      transform(params)
+
+  def test_fuse_by_keys_missing_keys_warn(self):
+    params = {
+        "a": jnp.array([1]),
+        "c": jnp.array([3]),
+    }
+    transform = fusing.fuse_by_keys(
+        source_keys=["a", "b"], target_key="ab", on_missing="warn"
+    )
 
     with self.assertLogs(level="WARNING"):
       result = transform(params)

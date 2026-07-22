@@ -15,9 +15,10 @@
 """Fusing utilities for model surgery."""
 
 import collections
+from collections.abc import Sequence
 import functools
 import re
-from typing import Any, Sequence
+from typing import Any
 
 from absl import logging
 import jax
@@ -25,13 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 from orbax.checkpoint.experimental.model_surgery.transformations import types
 
-
 Transformation = types.Transformation
-
-
-def _is_host_array(x) -> bool:
-  """True if x is a jax.Array on CPU."""
-  return isinstance(x, jax.Array) and next(iter(x.devices())).platform == "cpu"
 
 
 @functools.partial(jax.jit, backend="cpu", static_argnames=("axis",))
@@ -48,8 +43,7 @@ def _fuse_keys(
   """Fuses values of keys_to_fuse into fused_key in params_dict."""
   vals_to_fuse = [params_dict[k] for k in keys_to_fuse]
 
-  if all(_is_host_array(x) for x in vals_to_fuse):
-    logging.info("DEBUG: Fusing %s on CPU", fused_key)
+  if all(types.is_host_array(x) for x in vals_to_fuse):
     # Force concatenation on CPU using JAX to avoid touching TPU
     fused_val = _cpu_concat(vals_to_fuse, axis=axis)
   else:
@@ -62,12 +56,25 @@ def _fuse_keys(
   params_dict[fused_key] = fused_val
 
 
+def _report_incomplete(on_missing: str, message: str) -> None:
+  """Raises or warns on an incomplete fuse group, per `on_missing`."""
+  if on_missing == "error":
+    raise ValueError(message)
+  if on_missing == "warn":
+    logging.warning(message)
+    return
+  raise ValueError(
+      f"on_missing must be 'error' or 'warn', got {on_missing!r}."
+  )
+
+
 def fuse_by_pattern(
     *,
     pattern: str,
     unique_parts: Sequence[str],
     fused_unique_part: str,
     axis: int = 0,
+    on_missing: str = "error",
 ) -> Transformation:
   r"""Fuses parameters by finding sets that match a pattern.
 
@@ -87,6 +94,8 @@ def fuse_by_pattern(
       unique_parts: Ordered sequence of unique parts to find and concatenate.
       fused_unique_part: The replacement unique part for the fused key.
       axis: Axis to concatenate along.
+      on_missing: "error" (default) to raise on an incomplete group, or "warn"
+        to log and leave the group unfused.
 
   Returns:
       A Transformation function.
@@ -105,6 +114,7 @@ def fuse_by_pattern(
     params = params[0]  # pyrefly: ignore[bad-assignment]
     groups = collections.defaultdict(dict)
 
+    # pylint: disable=line-too-long
     for key in params:
       if not compiled_pattern.match(key):  # pyrefly: ignore[no-matching-overload]
         continue
@@ -116,6 +126,7 @@ def fuse_by_pattern(
       unique_part = match_unique.group(0)
       if unique_part in unique_parts:
         groups[fused_key][unique_part] = key
+    # pylint: enable=line-too-long
 
     result = dict(params)  # pyrefly: ignore[no-matching-overload]
     del params
@@ -124,11 +135,10 @@ def fuse_by_pattern(
         keys_to_fuse = [unique_dict[p] for p in unique_parts]
         _fuse_keys(result, keys_to_fuse, fused_key, axis)
       else:
-        logging.warning(
-            "Could not fuse %s. Found parts: %s, expected: %s",
-            fused_key,
-            list(unique_dict.keys()),
-            unique_parts,
+        _report_incomplete(
+            on_missing,
+            f"Could not fuse {fused_key!r}. Found parts"
+            f" {list(unique_dict.keys())}, expected {list(unique_parts)}.",
         )
 
     return result
@@ -141,6 +151,7 @@ def fuse_by_keys(
     source_keys: Sequence[str],
     target_key: str,
     axis: int = 0,
+    on_missing: str = "error",
 ) -> Transformation:
   """Fuses a specific set of source keys into a single target key.
 
@@ -158,6 +169,8 @@ def fuse_by_keys(
       source_keys: Ordered sequence of keys to find and concatenate.
       target_key: The replacement key for the fused key.
       axis: Axis to concatenate along.
+      on_missing: "error" (default) to raise when only some keys are present, or
+        "warn" to log and leave them unfused.
 
   Returns:
       A Transformation function.
@@ -177,11 +190,10 @@ def fuse_by_keys(
     if len(found_keys) == len(source_keys):
       _fuse_keys(result, source_keys, target_key, axis)
     elif found_keys:
-      logging.warning(
-          "Could not fuse %s. Found keys: %s, expected: %s",
-          target_key,
-          found_keys,
-          source_keys,
+      _report_incomplete(
+          on_missing,
+          f"Could not fuse {target_key!r}. Found keys {found_keys}, expected"
+          f" {list(source_keys)}.",
       )
 
     return result

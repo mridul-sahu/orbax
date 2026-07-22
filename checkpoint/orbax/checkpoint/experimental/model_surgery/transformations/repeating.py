@@ -14,9 +14,9 @@
 
 """Repeating utilities for model surgery."""
 
+from collections.abc import Sequence
 import functools
 import re
-from typing import Sequence
 
 from absl import logging
 import jax
@@ -24,13 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 from orbax.checkpoint.experimental.model_surgery.transformations import types
 
-
 Transformation = types.Transformation
-
-
-def _is_host_array(x) -> bool:
-  """True if x is a jax.Array on CPU."""
-  return isinstance(x, jax.Array) and next(iter(x.devices())).platform == "cpu"
 
 
 @functools.partial(jax.jit, backend="cpu", static_argnames=("repeats", "axis"))
@@ -39,12 +33,14 @@ def _cpu_repeat(array, *, repeats, axis):
 
 
 def _repeat_val(val, dimension: int, repeat_count: int) -> jax.Array:
-  if _is_host_array(val):
+  if types.is_host_array(val):
     # Ensure that host arrays are repeated on CPU, to avoid unnecessary
     # device transfers.
     return _cpu_repeat(val, repeats=repeat_count, axis=dimension)
   elif isinstance(val, np.ndarray):
-    return np.repeat(val, repeat_count, axis=dimension)  # pyrefly: ignore[bad-return]
+    return np.repeat(  # pyrefly: ignore[bad-return]
+        val, repeat_count, axis=dimension
+    )
   else:
     return jnp.repeat(val, repeat_count, axis=dimension)
 
@@ -102,6 +98,7 @@ def repeat_by_keys(
     target_keys: Sequence[str],
     dimension: int,
     repeat_count: int,
+    on_missing: str = "error",
 ) -> Transformation:
   """Repeats specific target keys.
 
@@ -119,6 +116,8 @@ def repeat_by_keys(
       target_keys: Sequence of keys to repeat.
       dimension: The axis/dimension to repeat along.
       repeat_count: Number of times to repeat elements.
+      on_missing: "error" (default) to raise when a target key is absent, or
+        "warn" to log and skip it.
 
   Returns:
       A Transformation function.
@@ -137,10 +136,18 @@ def repeat_by_keys(
 
     missing_keys = [k for k in target_keys if k not in result]
     if missing_keys:
-      logging.warning(
-          "Could not repeat keys %s. They were not found in params.",
-          missing_keys,
+      message = (
+          f"Could not repeat keys {missing_keys}. They were not found in"
+          " params."
       )
+      if on_missing == "error":
+        raise ValueError(message)
+      if on_missing == "warn":
+        logging.warning(message)
+      else:
+        raise ValueError(
+            f"on_missing must be 'error' or 'warn', got {on_missing!r}."
+        )
 
     for k in target_keys:
       if k in result:

@@ -58,12 +58,25 @@ class RepeatingTest(absltest.TestCase):
     )
     np.testing.assert_array_equal(result["b"], jnp.array([5]))
 
-  def test_repeat_by_keys_missing(self):
+  def test_repeat_by_keys_missing_raises(self):
     params = {
         "a": jnp.array([[1, 2], [3, 4]]),
     }
     transform = repeating.repeat_by_keys(
         target_keys=["missing_key"], dimension=1, repeat_count=2
+    )
+    with self.assertRaisesRegex(ValueError, "Could not repeat"):
+      transform(params)
+
+  def test_repeat_by_keys_missing_warn(self):
+    params = {
+        "a": jnp.array([[1, 2], [3, 4]]),
+    }
+    transform = repeating.repeat_by_keys(
+        target_keys=["missing_key"],
+        dimension=1,
+        repeat_count=2,
+        on_missing="warn",
     )
     with self.assertLogs(level="WARNING"):
       result = transform(params)
