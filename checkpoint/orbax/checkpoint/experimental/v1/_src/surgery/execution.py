@@ -334,6 +334,13 @@ def _assemble_leaf(
   Returns:
     The assembled `jax.Array`.
   """
+  if leaf.transform is not None:
+    full = manifest_lib.assemble_host(leaf)
+
+    def transformed_callback(index) -> np.ndarray:
+      return full[_region_from_index(index, shape).slices]
+
+    return jax.make_array_from_callback(shape, sharding, transformed_callback)
 
   def callback(index) -> np.ndarray:
     shard_region = _region_from_index(index, shape)

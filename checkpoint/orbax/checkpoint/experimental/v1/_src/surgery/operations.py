@@ -874,6 +874,54 @@ def mirror(*, onto: Sequence[str]) -> Op:
   )
 
 
+def compute(
+    pattern: str, fn: Callable[[np.ndarray], np.ndarray]
+) -> Op:
+  """Runs an arbitrary function over each matched leaf.
+
+  This is the escape hatch for genuine arithmetic: averaging, rescaling, or
+  permuting weights. The matched leaf materializes, `fn` runs, and the result
+  re-enters the plan, so laziness elsewhere is unaffected and only the matched
+  inputs are read early. `fn` must preserve shape and dtype.
+
+  Args:
+    pattern: Regex matched against each key.
+    fn: A whole-array function applied to each matched leaf.
+
+  Returns:
+    An operation that computes over matching leaves.
+  """
+  compiled = re.compile(pattern)
+
+  def op(manifest: Manifest, ctx: ResolveContext) -> Manifest:
+    result: Manifest = {}
+    matched_any = False
+    for key, leaf in manifest.items():
+      if not compiled.search(key):
+        result[key] = leaf
+        continue
+      matched_any = True
+      v = manifest_lib.as_virtual(leaf)
+      result[key] = VirtualLeaf(
+          shape=v.shape,
+          dtype=v.dtype,
+          assignments=v.assignments,
+          init=v.init,
+          transform=fn,
+      )
+    if not matched_any:
+      ctx.report.add_error(
+          report_lib.UNMATCHED_RULE,
+          pattern,
+          f"compute pattern {pattern!r} matched no key",
+      )
+    return result
+
+  return Operation(
+      "compute", op, "compute is not invertible unless an inverse is supplied"
+  )
+
+
 def _unescape_literal(regex_text: str) -> str | None:
   """Returns the plain text of an escaped-literal regex, or None if it can't."""
   out = []

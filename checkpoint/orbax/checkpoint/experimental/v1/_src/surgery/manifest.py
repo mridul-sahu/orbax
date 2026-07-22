@@ -186,12 +186,16 @@ class VirtualLeaf:
     assignments: The source regions that fill it, in no particular order.
     init: Fills regions no assignment covers, or `None` if full coverage is
       required.
+    transform: A whole-array function applied after assembly, or `None`. Its
+      presence forces a full materialization, so it is the one escape from
+      per-shard streaming.
   """
 
   shape: Shape
   dtype: np.dtype
   assignments: tuple[Assignment, ...]
   init: InitFn | None = None
+  transform: Callable[[np.ndarray], np.ndarray] | None = None
 
 
 Leaf = LeafRef | VirtualLeaf
@@ -278,6 +282,36 @@ def align_to_target(array: np.ndarray, assignment: Assignment) -> np.ndarray:
   if assignment.sliced_source_axis is not None:
     return np.squeeze(array, assignment.sliced_source_axis)
   return array
+
+
+def assemble_host(leaf: VirtualLeaf) -> np.ndarray:
+  """Assembles a virtual leaf fully on host, applying any transform.
+
+  Used where the whole array is needed at once: a `compute` transform, or a
+  compute leaf feeding a shard.
+
+  Args:
+    leaf: The virtual leaf to assemble.
+
+  Returns:
+    The assembled host array.
+  """
+  if leaf.init is not None:
+    buf = np.array(leaf.init(leaf.shape, leaf.dtype), dtype=leaf.dtype)
+  else:
+    buf = np.empty(leaf.shape, dtype=leaf.dtype)
+  full = Region.full(leaf.shape)
+  for a in leaf.assignments:
+    hit = full.intersect(a.target_region)
+    if hit is None:
+      continue
+    chunk = align_to_target(a.ref.read(source_read_region(a, hit)), a)
+    if a.cast is not None:
+      chunk = chunk.astype(a.cast)
+    buf[hit.slices] = chunk
+  if leaf.transform is not None:
+    buf = np.asarray(leaf.transform(buf)).astype(leaf.dtype, copy=False)
+  return buf
 
 
 def overlapping_assignments(
