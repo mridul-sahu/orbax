@@ -29,6 +29,7 @@ import jax
 import numpy as np
 from orbax.checkpoint._src.serialization import tensorstore_utils as ts_utils
 from orbax.checkpoint.experimental.v1._src.metadata import loading as metadata_loading
+from orbax.checkpoint.experimental.v1._src.saving import saving as saving_lib
 from orbax.checkpoint.experimental.v1._src.surgery import manifest as manifest_lib
 from orbax.checkpoint.experimental.v1._src.surgery import pipeline as pipeline_lib
 from orbax.checkpoint.experimental.v1._src.surgery import trees
@@ -305,6 +306,28 @@ def load(source: Any, plan: pipeline_lib.Plan, *, target: Any) -> Any:
     A tree with the structure of `target` and assembled arrays as leaves.
   """
   return execute(plan, source, target)
+
+
+def save(path: Any, tree: Any, plan: pipeline_lib.Plan) -> None:
+  """Applies a plan to an in-memory tree and saves the result.
+
+  Combined with `Plan.inverse`, this is the export path: an import pipeline
+  flipped to its inverse turns a fine-tuned tree back into the source
+  convention on disk.
+
+  Args:
+    path: The destination checkpoint path.
+    tree: The in-memory tree to transform.
+    plan: The plan to apply.
+  """
+  resolved = plan.resolve(tree)
+  resolved.report.raise_if_errors()
+  result: dict[str, Any] = {}
+  for key, leaf in resolved.manifest.items():
+    result[key] = np.asarray(
+        manifest_lib.assemble_host(manifest_lib.as_virtual(leaf))
+    )
+  saving_lib.save(path, result)
 
 
 def _region_from_index(index, shape) -> Region:
