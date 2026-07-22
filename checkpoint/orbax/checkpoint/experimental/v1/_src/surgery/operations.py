@@ -77,6 +77,7 @@ class Operation:
   name: str
   apply: _Apply
   make_inverse: _MakeInverse | str
+  config: Any = None
 
   def __call__(self, manifest: Manifest, ctx: ResolveContext) -> Manifest:
     return self.apply(manifest, ctx)
@@ -840,6 +841,36 @@ def take(source: str, pattern: str, *, into: str) -> Op:
       "take",
       op,
       "take across namespaces cannot be inverted on a single-tree export",
+  )
+
+
+def mirror(*, onto: Sequence[str]) -> Op:
+  """Replays the preceding structural operations onto parallel subtrees.
+
+  A structural change to a parameter that leaves its optimizer moments behind
+  produces a checkpoint that resumes into garbage. This operation reshapes each
+  subtree under a listed prefix exactly as the parameters were reshaped, so a
+  stack that reshapes the parameters also reshapes both Adam moments in the same
+  plan. The pipeline flags a moment whose parameter moved without it as an
+  orphaned optimizer state.
+
+  Args:
+    onto: The key prefixes of the subtrees to mirror, for example
+      ("opt_state.mu.", "opt_state.nu.").
+
+  Returns:
+    An operation the pipeline reads to drive the mirroring.
+  """
+
+  def op(manifest: Manifest, ctx: ResolveContext) -> Manifest:
+    del ctx
+    return manifest
+
+  return Operation(
+      "mirror",
+      op,
+      "mirror cannot be inverted; build the export pipeline explicitly",
+      config=tuple(onto),
   )
 
 

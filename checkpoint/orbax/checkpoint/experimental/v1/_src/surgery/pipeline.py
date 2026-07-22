@@ -156,6 +156,37 @@ def _validate(
       )
 
 
+def _orphan_check(
+    manifest: Manifest,
+    consumed: set[str],
+    prefixes: tuple[str, ...],
+    report: PlanReport,
+) -> None:
+  """Flags a moment whose parameter moved without it.
+
+  A key outside every mirror subtree that ends with a consumed parameter key is
+  a moment left behind, so resolution names it as orphaned optimizer state.
+
+  Args:
+    manifest: The merged manifest.
+    consumed: The parameter keys the structural ops moved or removed.
+    prefixes: The mirror subtree prefixes.
+    report: The report to record errors in.
+  """
+  for key in manifest:
+    if any(key.startswith(p) for p in prefixes):
+      continue
+    for param in consumed:
+      if key != param and key.endswith(param) and key[: -len(param)]:
+        report.add_error(
+            report_lib.ORPHANED_OPTIMIZER_STATE,
+            key,
+            f"{key!r} was not transformed with its parameter {param!r};"
+            " mirror it or drop it",
+        )
+        break
+
+
 @dataclasses.dataclass
 class ResolvedPlan:
   """A fully resolved manifest and its account.
@@ -209,10 +240,82 @@ class Plan:
       manifest: Manifest = dict(source_refs[initial_namespace])
     else:
       manifest = {}
-    for op in self.ops:
-      manifest = op(manifest, ctx)
+    prefixes = tuple(
+        p for op in self.ops if op.name == "mirror" for p in op.config
+    )
+    if prefixes:
+      manifest = self._resolve_with_mirror(manifest, ctx, prefixes)
+    else:
+      for op in self.ops:
+        manifest = op(manifest, ctx)
     _validate(manifest, target_flat, ctx)
     return ResolvedPlan(manifest=manifest, report=ctx.report)
+
+  def _resolve_with_mirror(
+      self,
+      manifest: Manifest,
+      ctx: operations_lib.ResolveContext,
+      prefixes: tuple[str, ...],
+  ) -> Manifest:
+    """Runs the ops on the main tree and replays the pre-mirror ops on subtrees.
+
+    Args:
+      manifest: The initial manifest.
+      ctx: The resolution context.
+      prefixes: The subtree prefixes any mirror names.
+
+    Returns:
+      The merged manifest.
+    """
+    pre: list[Op] = []
+    post: list[Op] = []
+    seen_mirror = False
+    for op in self.ops:
+      if op.name == "mirror":
+        seen_mirror = True
+      elif seen_mirror:
+        post.append(op)
+      else:
+        pre.append(op)
+
+    main = {
+        key: leaf
+        for key, leaf in manifest.items()
+        if not any(key.startswith(p) for p in prefixes)
+    }
+    subtrees = {
+        p: {
+            key[len(p) :]: leaf
+            for key, leaf in manifest.items()
+            if key.startswith(p)
+        }
+        for p in prefixes
+    }
+
+    original_main = set(main)
+    for op in pre:
+      main = op(main, ctx)
+    consumed = original_main - set(main)
+
+    merged: Manifest = dict(main)
+    for prefix, subtree in subtrees.items():
+      replay_ctx = operations_lib.ResolveContext(
+          on_missing=ctx.on_missing,
+          report=PlanReport(),
+          source_refs=ctx.source_refs,
+          target=ctx.target,
+      )
+      for op in pre:
+        subtree = op(subtree, replay_ctx)
+      ctx.report.errors.extend(replay_ctx.report.errors)
+      for key, leaf in subtree.items():
+        merged[prefix + key] = leaf
+
+    for op in post:
+      merged = op(merged, ctx)
+
+    _orphan_check(merged, consumed, prefixes, ctx.report)
+    return merged
 
   def inverse(self) -> "Plan":
     """Returns a plan that undoes this one, for the export direction.

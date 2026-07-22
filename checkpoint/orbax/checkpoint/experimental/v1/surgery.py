@@ -38,6 +38,7 @@ from orbax.checkpoint.experimental.v1._src.surgery.execution import read_keys
 from orbax.checkpoint.experimental.v1._src.surgery.operations import cast
 from orbax.checkpoint.experimental.v1._src.surgery.operations import drop
 from orbax.checkpoint.experimental.v1._src.surgery.operations import fuse
+from orbax.checkpoint.experimental.v1._src.surgery.operations import mirror
 from orbax.checkpoint.experimental.v1._src.surgery.operations import rename
 from orbax.checkpoint.experimental.v1._src.surgery.operations import repeat
 from orbax.checkpoint.experimental.v1._src.surgery.operations import resize

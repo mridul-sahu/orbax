@@ -25,6 +25,7 @@ DTYPE_MISMATCH = "dtype_mismatch"
 UNMATCHED_RULE = "unmatched_rule"
 UNCOVERED_TARGET = "uncovered_target"
 OVERLAPPING_ASSIGNMENTS = "overlapping_assignments"
+ORPHANED_OPTIMIZER_STATE = "orphaned_optimizer_state"
 UNEXPECTED_KEY = "unexpected_key"
 RENAME_COLLISION = "rename_collision"
 
