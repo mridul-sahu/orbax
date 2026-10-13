@@ -49,7 +49,7 @@ import itertools
 import json
 import math
 import time
-from typing import Any, NamedTuple, cast
+from typing import Any, cast, NamedTuple
 
 from absl import logging
 import humanize
@@ -240,7 +240,10 @@ def _normalize_index(
   for s in resolved:  # pyrefly: ignore[not-iterable]
     if s.step not in (None, 1):
       raise ValueError(f"Strided shard index is unsupported: {s}.")
-  return tuple((int(s.start), int(s.stop)) for s in resolved)  # pyrefly: ignore[not-iterable]
+  return tuple(
+      (int(s.start), int(s.stop))
+      for s in resolved  # pyrefly: ignore[not-iterable]
+  )
 
 
 def _byte_strides(global_shape: arrays_types.Shape, itemsize: int) -> list[int]:
@@ -812,6 +815,33 @@ def _warn_if_over_read(
   )
 
 
+async def build_file_index(path: Path) -> dict[str, _FileEntry]:
+  """Maps each tensor name to the file, header entry and data offset holding it.
+
+  Args:
+    path: A `.safetensors` file, or a directory containing such files.
+
+  Returns:
+    One `_FileEntry` per tensor across every file.
+
+  Raises:
+    ValueError: If a file is truncated or a tensor name appears twice.
+  """
+  entries = await _read_all_headers(path)
+  await asyncio.gather(
+      *[_check_file_length(f, header, ds) for f, header, ds in entries]
+  )
+  file_index: dict[str, _FileEntry] = {}
+  for file_path, header, data_start in entries:
+    for name, info in header.items():
+      if name == "__metadata__":
+        continue
+      if name in file_index:
+        raise ValueError(f"Duplicate tensor {name} found in multiple files.")
+      file_index[name] = _FileEntry(file_path, info, data_start)
+  return file_index
+
+
 class SafetensorsLayout(CheckpointLayout):
   """Handles checkpoints in the HuggingFace Safetensors format.
 
@@ -952,20 +982,7 @@ class SafetensorsLayout(CheckpointLayout):
     )
 
   async def _build_file_index(self, path: Path) -> dict[str, _FileEntry]:
-    """Maps each tensor name to where to find it (`_FileEntry`)."""
-    entries = await _read_all_headers(path)
-    await asyncio.gather(
-        *[_check_file_length(f, header, ds) for f, header, ds in entries]
-    )
-    file_index: dict[str, _FileEntry] = {}
-    for file_path, header, data_start in entries:
-      for name, info in header.items():
-        if name == "__metadata__":
-          continue
-        if name in file_index:
-          raise ValueError(f"Duplicate tensor {name} found in multiple files.")
-        file_index[name] = _FileEntry(file_path, info, data_start)
-    return file_index
+    return await build_file_index(path)
 
   async def _load(
       self,
